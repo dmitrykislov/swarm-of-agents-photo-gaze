@@ -63,10 +63,19 @@ describe('GroupDetailView Component', () => {
   test('displays metadata for each photo', () => {
     render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
     expect(screen.getByText('reference.jpg')).toBeInTheDocument();
-    expect(screen.getByText(/Resolution: 4032x3024/)).toBeInTheDocument();
-    expect(screen.getByText(/Size: 3.2 MB/)).toBeInTheDocument();
-    expect(screen.getByText(/Created: 2024-01-15/)).toBeInTheDocument();
-    expect(screen.getByText(/Path: \/photos\/reference.jpg/)).toBeInTheDocument();
+    expect(screen.getByText('Resolution: 4032x3024')).toBeInTheDocument();
+    expect(screen.getByText('Size: 3.2 MB')).toBeInTheDocument();
+    expect(screen.getByText('Created: 2024-01-15')).toBeInTheDocument();
+    expect(screen.getByText('Path: /photos/reference.jpg')).toBeInTheDocument();
+  });
+
+  test('displays metadata for similar photos', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    expect(screen.getByText('Resolution: 3840x2160')).toBeInTheDocument();
+    expect(screen.getByText('Size: 2.8 MB')).toBeInTheDocument();
+    expect(screen.getByText('Created: 2024-01-16')).toBeInTheDocument();
+    expect(screen.getByText('Resolution: 2560x1920')).toBeInTheDocument();
+    expect(screen.getByText('Size: 1.5 MB')).toBeInTheDocument();
   });
 
   test('marks the best photo with indicator', () => {
@@ -76,6 +85,12 @@ describe('GroupDetailView Component', () => {
     // Best photo should be the reference (highest quality_score: 0.95)
     const bestCard = bestIndicator.closest('.photo-card');
     expect(bestCard).toHaveClass('best-photo');
+  });
+
+  test('only one best indicator exists', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const bestIndicators = screen.getAllByText('★ Best');
+    expect(bestIndicators).toHaveLength(1);
   });
 
   test('displays quality scores as percentages', () => {
@@ -169,12 +184,27 @@ describe('GroupDetailView Component', () => {
   test('closes modal when clicking outside (backdrop)', () => {
     render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
     const overlay = screen.getByText('Group Detail').closest('.group-detail-overlay');
+    // Click directly on the overlay (backdrop), not on the modal content
     fireEvent.click(overlay!);
     expect(mockOnClose).toHaveBeenCalled();
   });
 
   test('does not close modal when clicking inside modal content', () => {
     render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const modal = screen.getByText('Group Detail').closest('.group-detail-modal');
+    fireEvent.click(modal!);
+    expect(mockOnClose).not.toHaveBeenCalled();
+  });
+
+  test('renders larger images (not thumbnails)', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const images = screen.getAllByRole('img');
+    images.forEach((img) => {
+      expect(img).toHaveClass('detail-image');
+      expect(img).not.toHaveClass('thumbnail');
+    });
+  });
+});
     const modal = screen.getByText('Group Detail').closest('.group-detail-modal');
     fireEvent.click(modal!);
     expect(mockOnClose).not.toHaveBeenCalled();

@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import SimilarPhotosGrid from './SimilarPhotosGrid';
 import * as api from '../api';
@@ -185,6 +185,38 @@ describe('SimilarPhotosGrid Component', () => {
     render(<SimilarPhotosGrid jobId="test_job" />);
     await waitFor(() => {
       expect(screen.getByText('No similar photos found.')).toBeInTheDocument();
+    });
+  });
+
+  test('opens GroupDetailView overlay when clicking a group', async () => {
+    render(<SimilarPhotosGrid jobId="test_job" />);
+    await waitFor(() => {
+      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
+    });
+    // Click the first group container
+    const groupContainers = screen.getAllByRole('button');
+    fireEvent.click(groupContainers[0]);
+    // GroupDetailView overlay should appear with 'Group Detail' title
+    await waitFor(() => {
+      expect(screen.getByText('Group Detail')).toBeInTheDocument();
+    });
+  });
+
+  test('closes GroupDetailView overlay when close button is clicked', async () => {
+    render(<SimilarPhotosGrid jobId="test_job" />);
+    await waitFor(() => {
+      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
+    });
+    const groupContainers = screen.getAllByRole('button');
+    fireEvent.click(groupContainers[0]);
+    await waitFor(() => {
+      expect(screen.getByText('Group Detail')).toBeInTheDocument();
+    });
+    // Click close button
+    const closeButton = screen.getByLabelText('Close');
+    fireEvent.click(closeButton);
+    await waitFor(() => {
+      expect(screen.queryByText('Group Detail')).not.toBeInTheDocument();
     });
   });
 
