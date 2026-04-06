@@ -322,6 +322,25 @@ export interface ThresholdExample {
 }
 
 /**
+ * Deduplicate (delete) selected photos by their IDs.
+ * @param photoIds - Array of photo IDs to delete
+ * @returns Promise resolving to deletion result with count and message
+ * @throws Error if request fails
+ */
+export async function deduplicatePhotos(photoIds: number[]): Promise<{ deleted: number; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/deduplicate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ photo_ids: photoIds }),
+  });
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(errorData.error || `Failed to deduplicate photos: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+/**
  * Fetch pre-computed threshold examples for a job to help the user
  * pick a sensible similarity threshold.
  */

@@ -110,3 +110,13 @@
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-medium);
 }
+
+/* Clickable group rows to open detail view */
+.group-container {
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.group-container:hover {
+  background-color: #f0f4ff;
+}
