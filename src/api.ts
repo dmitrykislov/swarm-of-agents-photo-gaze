@@ -202,24 +202,30 @@ export function connectProgressWebSocket(
     console.log(`Disconnected from progress updates for job ${jobId}`);
   };
   
-  // Return cleanup function
-  return () => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.close();
-    }
-  };
+  return () => ws.close();
+}
+
+export async function fetchSimilarPhotos(jobId: string): Promise<any[]> {
+  const response = await apiFetch(`${API_BASE_URL}/similar-photos/${jobId}`);
+  return response.json();
+}
+
+export async function searchSimilarPhotos(jobId: string, threshold: number): Promise<any[]> {
+  const response = await apiFetch(`${API_BASE_URL}/similar-photos/${jobId}?threshold=${threshold}`);
+  return response.json();
 }
 
 /**
- * Fetch user preferences from backend.
- * @param username - Username to fetch preferences for
- * @returns Promise resolving to user preferences object
- * @throws Error if request fails
+ * Delete duplicate photos by their IDs. Uses apiFetch for consistent error handling.
  */
-export async function fetchPreferences(username: string): Promise<UserPreferences> {
-  // Backend has no /preferences endpoint yet — serve from localStorage.
-  const stored = localStorage.getItem(`preferences:${username}`);
-  if (stored) {
+export async function deduplicatePhotos(photoIds: number[]): Promise<{ deleted: number; message: string }> {
+  const response = await apiFetch(`${API_BASE_URL}/deduplicate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ photo_ids: photoIds }),
+  });
+  return response.json();
+}
     return JSON.parse(stored) as UserPreferences;
   }
   throw new Error('No stored preferences');

@@ -15,6 +15,9 @@ describe('SimilarPhotosGrid Component', () => {
         filename: 'reference1.jpg',
         path: '/photos/reference1.jpg',
         quality_score: 0.95,
+        resolution: '4032x3024',
+        file_size: '3.2 MB',
+        created_date: '2024-01-15',
       },
       similar_photos: [
         {
@@ -23,6 +26,9 @@ describe('SimilarPhotosGrid Component', () => {
           path: '/photos/similar1.jpg',
           similarity_score: 0.92,
           quality_score: 0.88,
+          resolution: '3840x2160',
+          file_size: '2.8 MB',
+          created_date: '2024-01-16',
         },
         {
           photo_id: 3,
@@ -30,6 +36,9 @@ describe('SimilarPhotosGrid Component', () => {
           path: '/photos/similar2.jpg',
           similarity_score: 0.85,
           quality_score: 0.75,
+          resolution: '2560x1920',
+          file_size: '1.5 MB',
+          created_date: '2024-01-17',
         },
       ],
     },
@@ -200,6 +209,54 @@ describe('SimilarPhotosGrid Component', () => {
     await waitFor(() => {
       expect(screen.getByText('Group Detail')).toBeInTheDocument();
     });
+  });
+
+  test('closes GroupDetailView overlay when close button is clicked', async () => {
+    render(<SimilarPhotosGrid jobId="test_job" />);
+    await waitFor(() => {
+      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
+    });
+    // Open the detail view
+    const groupContainers = screen.getAllByRole('button');
+    fireEvent.click(groupContainers[0]);
+    await waitFor(() => {
+      expect(screen.getByText('Group Detail')).toBeInTheDocument();
+    });
+    // Close it
+    const closeButton = screen.getByLabelText('Close');
+    fireEvent.click(closeButton);
+    await waitFor(() => {
+      expect(screen.queryByText('Group Detail')).not.toBeInTheDocument();
+    });
+  });
+
+  test('shows metadata in detail overlay', async () => {
+    render(<SimilarPhotosGrid jobId="test_job" />);
+    await waitFor(() => {
+      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
+    });
+    // Click the first group to open detail
+    const groupContainers = screen.getAllByRole('button');
+    fireEvent.click(groupContainers[0]);
+    await waitFor(() => {
+      expect(screen.getByText('Resolution: 4032x3024')).toBeInTheDocument();
+      expect(screen.getByText('Size: 3.2 MB')).toBeInTheDocument();
+      expect(screen.getByText('Created: 2024-01-15')).toBeInTheDocument();
+    });
+  });
+
+  test('shows best photo indicator in detail overlay', async () => {
+    render(<SimilarPhotosGrid jobId="test_job" />);
+    await waitFor(() => {
+      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
+    });
+    const groupContainers = screen.getAllByRole('button');
+    fireEvent.click(groupContainers[0]);
+    await waitFor(() => {
+      expect(screen.getByText('★ Best')).toBeInTheDocument();
+    });
+  });
+});
   });
 
   test('closes GroupDetailView overlay when close button is clicked', async () => {

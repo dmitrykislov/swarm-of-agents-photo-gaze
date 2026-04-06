@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import { deduplicatePhotos } from '../api';
 import './GroupDetailView.css';
 
@@ -13,33 +13,46 @@ interface Photo {
   similarity_score?: number;
 }
 
-interface SimilarPhotosGroup {
+interface SimilarityGroup {
   group_id: string;
   reference_photo: Photo;
   similar_photos: Photo[];
 }
 
 interface GroupDetailViewProps {
-  group: SimilarPhotosGroup;
+  group: SimilarityGroup;
   onClose: () => void;
 }
 
+/**
+ * Full-screen overlay showing all images in a similarity group at larger size,
+ * with metadata, best-photo indicator, and deduplication controls.
+ */
 const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose }) => {
-  const [selectedPhotoIds, setSelectedPhotoIds] = useState<Set<number>>(new Set());
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [statusMessage, setStatusMessage] = useState<string>('');
 
-  const allPhotos: Photo[] = [group.reference_photo, ...group.similar_photos];
+  // Collect all photos: reference + similar
+  const allPhotos = useMemo(() => {
+    return [group.reference_photo, ...group.similar_photos];
+  }, [group]);
 
-  // Determine best photo: highest quality_score wins
-  const bestPhotoId = allPhotos.reduce((bestId, photo) => {
-    const bestPhoto = allPhotos.find((p) => p.photo_id === bestId);
-    const bestScore = bestPhoto?.quality_score ?? 0;
-    const currentScore = photo.quality_score ?? 0;
-    return currentScore > bestScore ? photo.photo_id : bestId;
-  }, allPhotos[0].photo_id);
+  // Determine best photo: highest quality_score (O(n) single pass)
+  const bestPhotoId = useMemo(() => {
+    let bestId = allPhotos[0]?.photo_id;
+    let bestScore = allPhotos[0]?.quality_score ?? 0;
+    for (let i = 1; i < allPhotos.length; i++) {
+      const score = allPhotos[i].quality_score ?? 0;
+      if (score > bestScore) {
+        bestScore = score;
+        bestId = allPhotos[i].photo_id;
+      }
+    }
+    return bestId;
+  }, [allPhotos]);
 
-  const toggleSelection = (photoId: number) => {
-    setSelectedPhotoIds((prev) => {
+  const toggleSelection = useCallback((photoId: number) => {
+    setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(photoId)) {
         next.delete(photoId);
@@ -48,44 +61,39 @@ const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose }) => 
       }
       return next;
     });
-  };
+  }, []);
 
   const handleDelete = async () => {
-    const photoIds = Array.from(selectedPhotoIds);
-    if (photoIds.length === 0) return;
+    if (selectedIds.size === 0) return;
     try {
-      const result = await deduplicatePhotos(photoIds);
-      setStatusMessage(`Successfully deleted ${result.deleted} photo(s)`);
-      setSelectedPhotoIds(new Set());
+      const ids = Array.from(selectedIds);
+      const result = await deduplicatePhotos(ids);
+      setStatusMessage(`Successfully deleted ${result.deleted} photo(s).`);
+      setSelectedIds(new Set());
     } catch (err: any) {
       setStatusMessage(`Error: ${err.message}`);
     }
   };
 
+  /** Close when clicking the overlay backdrop (not the modal content) */
   const handleOverlayClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    // Close when clicking the overlay backdrop, not the modal content
     if (e.target === e.currentTarget) {
       onClose();
     }
   };
 
   return (
-    <div className="group-detail-overlay" onClick={handleOverlayClick}>
-      <div className="group-detail-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="group-detail-header">
+    <div className="group-detail-overlay" onClick={handleOverlayClick} data-testid="group-detail-overlay">
+      <div className="group-detail-modal">
+        <div className="modal-header">
           <h2>Group Detail</h2>
-          <button className="close-button" aria-label="Close" onClick={onClose}>
-            &times;
-          </button>
+          <button className="close-button" onClick={onClose} aria-label="Close">✕</button>
         </div>
 
-        {statusMessage && (
-          <div className="status-message">{statusMessage}</div>
-        )}
-
-        <div className="group-detail-photos">
-          {allPhotos.map((photo) => {
+        <div className="photos-grid">
+          {allPhotos.map(photo => {
             const isBest = photo.photo_id === bestPhotoId;
+            const isSelected = selectedIds.has(photo.photo_id);
             return (
               <div
                 key={photo.photo_id}
@@ -93,43 +101,44 @@ const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose }) => 
               >
                 {isBest && <span className="best-indicator">★ Best</span>}
                 <img
-                  src={photo.path}
-                  alt={photo.filename}
                   className="detail-image"
+                  src={`/api/photos/${photo.photo_id}/image`}
+                  alt={photo.filename}
                 />
                 <div className="photo-metadata">
-                  <p className="photo-filename">{photo.filename}</p>
-                  <p>Quality: {((photo.quality_score ?? 0) * 100).toFixed(1)}%</p>
+                  <p className="filename">{photo.filename}</p>
                   {photo.resolution && <p>Resolution: {photo.resolution}</p>}
                   {photo.file_size && <p>Size: {photo.file_size}</p>}
                   {photo.created_date && <p>Created: {photo.created_date}</p>}
                   <p>Path: {photo.path}</p>
-                  {photo.similarity_score !== undefined && (
-                    <p>Similarity: {(photo.similarity_score * 100).toFixed(1)}%</p>
+                  {photo.quality_score != null && (
+                    <p>Quality: {(photo.quality_score * 100).toFixed(1)}%</p>
                   )}
                 </div>
-                <div className="photo-checkbox">
+                <label className="checkbox-label">
                   <input
                     type="checkbox"
-                    checked={selectedPhotoIds.has(photo.photo_id)}
+                    checked={isSelected}
                     disabled={isBest}
                     title={isBest ? 'Cannot delete the best photo' : 'Select for deletion'}
                     onChange={() => toggleSelection(photo.photo_id)}
                   />
-                </div>
+                  {isBest ? 'Keep (best)' : 'Select'}
+                </label>
               </div>
             );
           })}
         </div>
 
-        <div className="group-detail-actions">
+        <div className="modal-footer">
           <button
             className="delete-button"
+            disabled={selectedIds.size === 0}
             onClick={handleDelete}
-            disabled={selectedPhotoIds.size === 0}
           >
-            Delete Selected ({selectedPhotoIds.size})
+            Delete Selected ({selectedIds.size})
           </button>
+          {statusMessage && <p className="status-message">{statusMessage}</p>}
         </div>
       </div>
     </div>

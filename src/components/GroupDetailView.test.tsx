@@ -174,6 +174,51 @@ describe('GroupDetailView Component', () => {
     });
   });
 
+  test('closes modal when clicking close button', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const closeButton = screen.getByLabelText('Close');
+    fireEvent.click(closeButton);
+    expect(mockOnClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('closes modal when clicking overlay backdrop', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const overlay = screen.getByTestId('group-detail-overlay');
+    fireEvent.click(overlay);
+    expect(mockOnClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not close modal when clicking inside modal content', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const title = screen.getByText('Group Detail');
+    fireEvent.click(title);
+    expect(mockOnClose).not.toHaveBeenCalled();
+  });
+
+  test('disables delete button when no photos are selected', () => {
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const deleteButton = screen.getByText('Delete Selected (0)');
+    expect(deleteButton).toBeDisabled();
+  });
+
+  test('clears selection after successful deduplication', async () => {
+    (api.deduplicatePhotos as jest.Mock).mockResolvedValue({
+      deleted: 1,
+      message: 'Photo deleted successfully',
+    });
+    render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
+    const checkboxes = screen.getAllByRole('checkbox');
+    fireEvent.click(checkboxes[1]);
+    expect(checkboxes[1]).toBeChecked();
+    const deleteButton = screen.getByText('Delete Selected (1)');
+    fireEvent.click(deleteButton);
+    await waitFor(() => {
+      expect(screen.getByText('Delete Selected (0)')).toBeInTheDocument();
+    });
+  });
+});
+  });
+
   test('closes modal when close button is clicked', () => {
     render(<GroupDetailView group={mockGroup} onClose={mockOnClose} />);
     const closeButton = screen.getByLabelText('Close');
