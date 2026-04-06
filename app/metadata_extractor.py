@@ -44,9 +44,8 @@ class MetadataExtractor:
         except Exception as e:
             pass
         
-        metadata['created_date'] = MetadataExtractor._extract_exif_date(file_path)
-        if not metadata['created_date']:
-            metadata['created_date'] = metadata['modified_date']
+        exif_date = MetadataExtractor._extract_exif_date(file_path)
+        metadata['created_date'] = exif_date if exif_date else metadata['modified_date']
         
         metadata['camera_info'] = MetadataExtractor._extract_camera_info(file_path)
         
