@@ -10,7 +10,11 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressUpdate | null>(null);
-  const [jobId, setJobId] = useState<string>('test_job_001');
+  // Empty until a real scan/process job starts. The progress WebSocket
+  // effect short-circuits on a falsy jobId, so this avoids opening a
+  // connection to a non-existent job on first load (the old default
+  // 'test_job_001' did exactly that and surfaced a phantom job).
+  const [jobId, setJobId] = useState<string>('');
   const [wsConnected, setWsConnected] = useState(false);
   const [username, setUsername] = useState<string>(() => localStorage.getItem('username') || 'default_user');
   const [preferences, setPreferences] = useState<UserPreferences | null>(null);

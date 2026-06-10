@@ -180,11 +180,14 @@ class TestExtractMetadataErrorHandling:
     
     @pytest.mark.unit
     def test_extract_unsupported_format(self):
-        """Verify ValueError is raised for unsupported image format."""
-        with tempfile.NamedTemporaryFile(suffix=".bmp", delete=False) as f:
-            # Create a BMP image (not in SUPPORTED_FORMATS)
+        """Verify ValueError is raised for an unsupported image format.
+
+        BMP/GIF/etc. are now first-class supported formats (the app handles 22
+        formats), so use PPM — a format Pillow can write but the pipeline does
+        not accept — to exercise the rejection path."""
+        with tempfile.NamedTemporaryFile(suffix=".ppm", delete=False) as f:
             img = Image.new('RGB', (100, 100), color='red')
-            img.save(f.name, 'BMP')
+            img.save(f.name, 'PPM')
             with pytest.raises(ValueError, match="Unsupported image format"):
                 extract_metadata(f.name)
         os.unlink(f.name)
@@ -192,12 +195,14 @@ class TestExtractMetadataErrorHandling:
 
 class TestSupportedFormats:
     """Unit tests for supported formats constant."""
-    
+
     @pytest.mark.unit
     def test_supported_formats_contains_required_formats(self):
-        """Verify SUPPORTED_FORMATS includes all required formats."""
+        """The core formats must always be supported. SUPPORTED_FORMATS has
+        since grown to cover 22 formats (HEIF, AVIF, RAW variants, …); assert
+        the required ones are a subset rather than pinning the exact set."""
         required = {'JPEG', 'PNG', 'WEBP', 'RAW'}
-        assert SUPPORTED_FORMATS == required
+        assert required.issubset(SUPPORTED_FORMATS)
 
 
 class TestMetadataIntegration:

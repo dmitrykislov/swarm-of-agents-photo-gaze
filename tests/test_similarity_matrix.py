@@ -77,6 +77,17 @@ class _FakeQdrant:
             next_offset = None
         return page, next_offset
 
+    def retrieve(self, *, collection_name, ids, with_vectors=False):
+        """Return stored points (id + raw vector) for the given point ids,
+        mirroring qdrant_client.retrieve. Used by incremental add."""
+        by_id = {p.id: p for p in self._points}
+        out = []
+        for pid in ids:
+            p = by_id.get(pid)
+            if p is not None:
+                out.append(_FakePoint(id=p.id, vector=p.vector, payload=p.payload))
+        return out
+
     def search_batch(self, *, collection_name, requests):
         self.search_batch_calls += 1
         results = []
@@ -253,7 +264,10 @@ class TestComputeSimCache:
         assert mgr.qdrant_client.scroll_calls == 3  # 2+2+1
         assert data["vectors"].shape == (5, 4)
         assert len(data["photo_ids"]) == 5
-        assert len(data["adjacency"]) == 5
+        # Steady-state cache stores the compact edge index, not the directed
+        # adjacency list (dropped to save memory at scale).
+        assert "edge_arrays" in data
+        assert "adjacency" not in data
         assert set(meta.keys()) == {1, 2, 3, 4, 5}
 
     def test_vectors_diagonal_is_one_after_normalization(self):
@@ -316,9 +330,9 @@ class TestComputeSimCache:
         assert data["photo_ids"] == [1, 3]
         assert 99 not in meta
 
-    def test_adjacency_excludes_self_and_below_threshold(self):
+    def test_edge_index_excludes_self_and_below_threshold(self):
         """Build a small set with two near-identical vectors and one
-        orthogonal. Adjacency must contain the i↔j edge but not self-loops
+        orthogonal. The edge index must contain the i↔j edge but no self-loop
         and not the orthogonal edge."""
         # Two identical-direction vectors (sim=1) + one orthogonal.
         v_a = np.array([1.0, 0.0, 0.0, 0.0])
@@ -334,12 +348,12 @@ class TestComputeSimCache:
         mgr = _FakeJobQueueManager(qdrant_points=points, photo_rows=rows)
         with patch.object(app_main, "job_queue_manager", mgr):
             data, _ = app_main._compute_sim_cache()
-        # photo_id 1 must list 2 as neighbour, not 3, not itself.
-        adj_for_1 = data["adjacency"][0]
-        neigh_idx = {j for j, _ in adj_for_1}
-        assert 1 in neigh_idx       # idx 1 → photo_id 2
-        assert 0 not in neigh_idx   # no self-loop
-        assert 2 not in neigh_idx   # the orthogonal C is below 0.7
+        # The only undirected edge is idx 0 ↔ idx 1 (photos 1↔2). No self-loop,
+        # and the orthogonal photo 3 (idx 2) is below the 0.7 floor.
+        scores, i_idx, j_idx = data["edge_arrays"]
+        pairs = {tuple(sorted((int(a), int(b)))) for a, b in zip(i_idx.tolist(), j_idx.tolist())}
+        assert pairs == {(0, 1)}
+        assert all(int(a) != int(b) for a, b in zip(i_idx.tolist(), j_idx.tolist()))
 
     def test_search_batch_called_for_all_points(self):
         """Every point must get a search query — confirms no point is skipped
@@ -421,6 +435,330 @@ class TestBuildSimilarityGroups:
         self._install_cache(m, [1, 2], meta)
         groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
         assert groups[0]["reference_photo"]["photo_id"] == 1
+
+    def test_transitive_chain_grouped_as_one_component(self):
+        """Regression: A~B and B~C with A just under threshold to C must form
+        ONE group of three (connected components), not split B's partner C off
+        into a dropped singleton the way the old greedy single-link clustering
+        did. Also keeps the displayed groups consistent with auto-dedupe."""
+        m = [
+            [1.00, 0.96, 0.50],   # A close to B, far from C
+            [0.96, 1.00, 0.96],   # B close to both
+            [0.50, 0.96, 1.00],   # C close to B, far from A
+        ]
+        meta = {
+            i: {"filename": f"p{i}.jpg", "file_path": "",
+                "file_size": 1000 * i, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"}
+            for i in (1, 2, 3)
+        }
+        self._install_cache(m, [1, 2, 3], meta)
+        groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
+        assert len(groups) == 1
+        g = groups[0]
+        member_ids = {g["reference_photo"]["photo_id"]} | {
+            p["photo_id"] for p in g["similar_photos"]
+        }
+        assert member_ids == {1, 2, 3}  # C (id 3) is NOT dropped
+
+    def test_quality_score_is_real_not_hardcoded(self):
+        """quality_score must reflect file size normalized across the
+        collection — not the old hard-coded 0.8 that made min_quality and
+        sort_by=quality no-ops and left the UI quality badges blank.
+
+        Photo 2 (5 MB) is the largest effective size in the collection, so it
+        scores 1.0; smaller members score proportionally less; the group's
+        quality_score equals its kept (Best) photo's."""
+        m = [
+            [1.0, 0.95, 0.92],
+            [0.95, 1.0, 0.94],
+            [0.92, 0.94, 1.0],
+        ]
+        meta = {
+            1: {"filename": "small.jpg", "file_path": "",
+                "file_size": 1_000_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+            2: {"filename": "big.jpg", "file_path": "",
+                "file_size": 5_000_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+            3: {"filename": "medium.jpg", "file_path": "",
+                "file_size": 2_000_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+        }
+        self._install_cache(m, [1, 2, 3], meta)
+        groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
+        g = groups[0]
+        ref = g["reference_photo"]
+        others = {p["photo_id"]: p["quality_score"] for p in g["similar_photos"]}
+
+        # Largest photo (id 2) is the reference and scores 1.0.
+        assert ref["photo_id"] == 2
+        assert ref["quality_score"] == pytest.approx(1.0)
+        # Group quality mirrors the kept photo.
+        assert g["quality_score"] == pytest.approx(1.0)
+        # Smaller members scale below 1.0 and differ from each other —
+        # proving the score is not a constant.
+        assert others[1] == pytest.approx(1_000_000 / 5_000_000)  # 0.2
+        assert others[3] == pytest.approx(2_000_000 / 5_000_000)  # 0.4
+        assert others[1] != others[3]
+
+    def test_quality_score_format_bonus_applied(self):
+        """A PNG/JPEG gets the same +20% effective-size bonus the keeper
+        ranking uses, so quality stays monotonic with 'Best' selection."""
+        m = [[1.0, 0.99], [0.99, 1.0]]
+        meta = {
+            1: {"filename": "a.jpg", "file_path": "",
+                "file_size": 100_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+            2: {"filename": "b.heic", "file_path": "",
+                "file_size": 100_000, "mime_type": "image/heic",
+                "uploaded_at": "2024-01-01T00:00:00"},
+        }
+        self._install_cache(m, [1, 2], meta)
+        g = app_main._build_similarity_groups_from_qdrant(threshold=0.9)[0]
+        # jpeg effective size = 120k is the collection max → 1.0; heic 100k → ~0.833
+        assert g["reference_photo"]["photo_id"] == 1
+        heic = next(p for p in g["similar_photos"] if p["photo_id"] == 2)
+        assert heic["quality_score"] == pytest.approx(100_000 / 120_000, abs=1e-4)
+
+
+class TestClusteringScalability:
+    """The per-slider-tick clustering must stay cheap on huge collections:
+    cost should track the number of edges ABOVE the threshold, not the total
+    photo count. These tests build a large, mostly-noise edge index and assert
+    a high-threshold query returns only the few real clusters (and quickly)."""
+
+    def _install_edge_cache(self, n, edges):
+        """Install a cache directly from an undirected edge list
+        [(i, j, score), ...] for `n` photos, bypassing adjacency so we can
+        cheaply fabricate hundreds of thousands of photos."""
+        scores = np.array([e[2] for e in edges], dtype=np.float64)
+        order = np.argsort(scores, kind="stable")  # ascending, as production
+        i_idx = np.array([edges[k][0] for k in order], dtype=np.int32)
+        j_idx = np.array([edges[k][1] for k in order], dtype=np.int32)
+        scores = scores[order]
+        meta = {
+            pid: {"filename": f"p{pid}.jpg", "file_path": f"/p/{pid}.jpg",
+                  "file_size": 1000 + pid, "mime_type": "image/jpeg",
+                  "uploaded_at": "2024-01-01T00:00:00"}
+            for pid in range(1, n + 1)
+        }
+        app_main._sim_cache.update(
+            data={
+                "vectors": np.tile(np.array([1.0, 0.0], dtype=np.float32), (n, 1)),
+                "photo_ids": list(range(1, n + 1)),
+                "point_ids": [f"q{p}" for p in range(1, n + 1)],
+                "adjacency": [],            # forces use of edge_arrays
+                "edge_arrays": (scores, i_idx, j_idx),
+                "cache_threshold": 0.70,
+            },
+            meta=meta,
+        )
+
+    def test_high_threshold_query_only_touches_active_edges(self):
+        import time
+        n = 120_000
+        # 60k noise edges below the query threshold + two real duplicate edges.
+        rng = np.random.default_rng(7)
+        noise = [
+            (int(a), int(b), 0.75)
+            for a, b in rng.integers(0, n, size=(60_000, 2))
+            if a != b
+        ]
+        real = [(0, 1, 0.97), (2, 3, 0.96)]  # idx 0/1 → pids 1/2 ; 2/3 → 3/4
+        self._install_edge_cache(n, noise + real)
+
+        t0 = time.time()
+        groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
+        elapsed = time.time() - t0
+
+        # Only the two real clusters survive the 0.9 threshold.
+        assert len(groups) == 2
+        member_ids = sorted(
+            {g["reference_photo"]["photo_id"] for g in groups}
+            | {p["photo_id"] for g in groups for p in g["similar_photos"]}
+        )
+        assert member_ids == [1, 2, 3, 4]
+        # Backstop against accidental O(N) / O(N·E) reintroduction. The active
+        # set is 2 edges; this is generous but would fail loudly on a per-photo
+        # set allocation over 120k photos done in a tight loop.
+        assert elapsed < 2.0
+
+    def test_incremental_removal_filters_and_remaps(self):
+        """_remove_photos_from_cache must drop the deleted photos, keep the
+        surviving edges with correctly REMAPPED indices, and leave the groups
+        consistent — without a full rebuild. This is the fast delete path used
+        by /deduplicate and folder-delete at 300k scale."""
+        # 3 photos: 1~2 (0.97) and 2~3 (0.96) → one chain component {1,2,3}.
+        self._install_edge_cache(3, [(0, 1, 0.97), (1, 2, 0.96)])
+        # Delete photo 2 (the chain's middle) → 1 and 3 are no longer linked.
+        app_main._remove_photos_from_cache({2})
+
+        data = app_main._sim_cache["data"]
+        assert data["photo_ids"] == [1, 3]            # 2 removed, order preserved
+        scores, ii, jj = app_main._get_edge_arrays(data)
+        # Both surviving edges touched photo 2, so no edges remain.
+        assert scores.size == 0
+        assert app_main._build_similarity_groups_from_qdrant(threshold=0.9) == []
+
+    def test_incremental_removal_remaps_surviving_edge(self):
+        """A surviving edge's endpoints must be remapped to the new compacted
+        indices (deleting an earlier photo shifts later indices down)."""
+        # photos 1,2,3,4 ; edge between 3 and 4 (idx 2,3) at 0.97.
+        self._install_edge_cache(4, [(2, 3, 0.97)])
+        app_main._remove_photos_from_cache({1})  # drop idx 0 → others shift down
+        data = app_main._sim_cache["data"]
+        assert data["photo_ids"] == [2, 3, 4]
+        groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
+        assert len(groups) == 1
+        ids = {groups[0]["reference_photo"]["photo_id"]} | {
+            p["photo_id"] for p in groups[0]["similar_photos"]
+        }
+        assert ids == {3, 4}  # the 3~4 edge survived and still groups correctly
+
+    def test_merge_new_edges_dedups_and_sorts(self):
+        """_merge_new_edges keeps the max score per undirected pair, appends to
+        the existing edges, and returns them sorted ascending by score."""
+        existing = (
+            np.array([0.80], dtype=np.float64),
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+        )
+        # New node idx 5 reciprocally linked to 0 (two directions, diff scores)
+        # plus a link to 2. Reciprocal pair must collapse to its max (0.95).
+        merged = app_main._merge_new_edges(existing, [(5, 0, 0.93), (0, 5, 0.95), (5, 2, 0.88)])
+        scores, ii, jj = merged
+        assert list(scores) == sorted(scores)  # ascending
+        pairs = {
+            tuple(sorted((int(a), int(b)))): float(s)
+            for a, b, s in zip(ii.tolist(), jj.tolist(), scores.tolist())
+        }
+        assert pairs == {(0, 1): 0.80, (0, 5): 0.95, (2, 5): 0.88}
+
+    def test_incremental_add_merges_new_photo(self):
+        """End-to-end: adding a photo that duplicates an existing one links
+        them in the index WITHOUT rebuilding from scratch (only the new vector
+        is searched). Uses a real SQLite session + the fake Qdrant."""
+        from types import SimpleNamespace
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.models import Base, Photo, Embedding
+
+        # Existing index: photos 1 and 2, orthogonal (no edge).
+        v1 = [1.0, 0.0]
+        v2 = [0.0, 1.0]
+        v3 = [1.0, 0.0]  # photo 3 duplicates photo 1
+        base_meta = {
+            1: {"filename": "a.jpg", "file_path": "/p/a.jpg", "file_size": 1000,
+                "mime_type": "image/jpeg", "uploaded_at": "2024-01-01T00:00:00"},
+            2: {"filename": "b.jpg", "file_path": "/p/b.jpg", "file_size": 1000,
+                "mime_type": "image/jpeg", "uploaded_at": "2024-01-01T00:00:00"},
+        }
+        app_main._sim_cache.update(
+            data={
+                "vectors": np.array([v1, v2], dtype=np.float32),
+                "photo_ids": [1, 2],
+                "point_ids": ["q1", "q2"],
+                "edge_arrays": (np.empty(0, np.float64),
+                                np.empty(0, np.int32), np.empty(0, np.int32)),
+                "max_effective_size": 1200.0,
+                "cache_threshold": 0.70,
+            },
+            meta=dict(base_meta),
+        )
+
+        # SQLite with the new photo's Photo + Embedding rows.
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        s = Session()
+        s.add(Photo(id=3, filename="c.jpg", file_path="/p/c.jpg", file_size=2000,
+                    mime_type="image/jpeg"))
+        s.add(Embedding(photo_id=3, embedding_model="m", vector_dimension=2,
+                        qdrant_point_id="q3"))
+        s.commit(); s.close()
+
+        # Fake Qdrant holds all three points so the new vector's search finds
+        # photo 1 as a neighbour.
+        points = [
+            _FakePoint(id="q1", vector=v1, payload={"photo_id": 1}),
+            _FakePoint(id="q2", vector=v2, payload={"photo_id": 2}),
+            _FakePoint(id="q3", vector=v3, payload={"photo_id": 3}),
+        ]
+        mgr = SimpleNamespace(qdrant_client=_FakeQdrant(points), SessionLocal=Session)
+
+        with patch.object(app_main, "job_queue_manager", mgr):
+            new_data, new_meta = app_main._incremental_add_sync({3})
+
+        assert new_data is not None
+        assert new_data["photo_ids"] == [1, 2, 3]
+        assert 3 in new_meta
+        # Photo 3 (idx 2) is linked to photo 1 (idx 0); photo 2 stays isolated.
+        scores, ii, jj = new_data["edge_arrays"]
+        pairs = {tuple(sorted((int(a), int(b)))) for a, b in zip(ii.tolist(), jj.tolist())}
+        assert (0, 2) in pairs
+        # Feed it back and confirm the group materializes.
+        app_main._sim_cache.update(data=new_data, meta=new_meta)
+        groups = app_main._build_similarity_groups_from_qdrant(threshold=0.9)
+        assert len(groups) == 1
+        ids = {groups[0]["reference_photo"]["photo_id"]} | {
+            p["photo_id"] for p in groups[0]["similar_photos"]
+        }
+        assert ids == {1, 3}
+
+    def test_incremental_add_cold_cache_signals_fallback(self):
+        """With no base index built yet, _incremental_add_sync returns
+        (None, None) so the caller does a full recompute instead."""
+        from types import SimpleNamespace
+        app_main._sim_cache.update(data=None, meta=None)
+        mgr = SimpleNamespace(qdrant_client=_FakeQdrant([]), SessionLocal=lambda: None)
+        with patch.object(app_main, "job_queue_manager", mgr):
+            assert app_main._incremental_add_sync({1}) == (None, None)
+
+    def test_edge_arrays_are_memoized(self):
+        self._install_edge_cache(10, [(0, 1, 0.95)])
+        data = app_main._sim_cache["data"]
+        first = app_main._get_edge_arrays(data)
+        second = app_main._get_edge_arrays(data)
+        # Same object identity → derived once, then cached.
+        assert first is second
+
+
+class TestGroupDetailFallback:
+    """The /similarity-groups/{id} detail endpoint historically read only the
+    in-memory similarity_group_service, which the running app never populates —
+    so it could only ever 404 in production. It now falls back to the live
+    cache-built groups."""
+
+    def test_detail_serves_cache_built_group_when_store_empty(self):
+        from fastapi.testclient import TestClient
+
+        m = [[1.0, 0.96], [0.96, 1.0]]
+        meta = {
+            1: {"filename": "small.jpg", "file_path": "",
+                "file_size": 1_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+            2: {"filename": "big.jpg", "file_path": "",
+                "file_size": 9_000, "mime_type": "image/jpeg",
+                "uploaded_at": "2024-01-01T00:00:00"},
+        }
+        _install_cache(m, [1, 2], meta)
+        app_main.similarity_group_service.clear()  # store empty → must fall back
+
+        client = TestClient(app_main.app)
+        resp = client.get("/similarity-groups/grp-2")  # ref is the larger photo
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["group_id"] == "grp-2"
+        assert body["reference_photo"]["photo_id"] == 2
+
+    def test_detail_unknown_group_still_404s(self):
+        from fastapi.testclient import TestClient
+
+        app_main.similarity_group_service.clear()
+        client = TestClient(app_main.app)
+        resp = client.get("/similarity-groups/grp-does-not-exist")
+        assert resp.status_code == 404
 
 
 class TestBestReasonsStrings:
@@ -618,8 +956,9 @@ class TestObservability:
         assert info["last_recompute_duration_ms"] is not None
         assert info["recompute_running"] is False
         assert info["vectors_in_index"] == 3
-        # A↔B is reciprocal → 2 directed edges; C is isolated → 0.
-        assert info["edges_in_index"] == 2
+        # edges_in_index now counts UNDIRECTED edges: A↔B is one edge; C is
+        # isolated → total 1.
+        assert info["edges_in_index"] == 1
 
 
 class TestTenPhotoEndToEnd:
@@ -778,13 +1117,13 @@ class TestTenPhotoEndToEnd:
 
     def test_memory_footprint_is_sparse(self):
         """The whole point of the rewrite. With 10 photos in 2 clusters of
-        4 and 3 plus 3 singletons, total directed edges should be small
-        (≤ 4*3 + 3*2 = 18), nowhere near a dense N² = 100."""
+        4 and 3 plus 3 singletons, the undirected edge count should be small
+        (≤ C(4,2) + C(3,2) = 9), nowhere near a dense N² = 100."""
         qpoints, prows = self._build_collection()
         mgr = _FakeJobQueueManager(qdrant_points=qpoints, photo_rows=prows)
         with patch.object(app_main, "job_queue_manager", mgr):
             data, _ = app_main._compute_sim_cache()
-        total_edges = sum(len(adj) for adj in data["adjacency"])
-        assert total_edges <= 18, f"adjacency exploded: {total_edges} edges"
+        total_edges = int(data["edge_arrays"][0].size)
+        assert total_edges <= 9, f"edge index exploded: {total_edges} edges"
         # Vectors stored separately for exact ref-vs-member scoring.
         assert data["vectors"].shape == (10, 8)

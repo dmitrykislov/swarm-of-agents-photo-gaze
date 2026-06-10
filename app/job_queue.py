@@ -64,7 +64,13 @@ class JobQueueManager:
                 status="pending",
                 total_photos=total_photos,
                 processed_photos=0,
-                checkpoint_count=0
+                checkpoint_count=0,
+                # Stamp started_at at creation so /ws/progress can compute an
+                # ETA. The live HTTP path (rescan / process-pending) fires
+                # process_photo tasks directly without the Orchestrator, so if
+                # we don't set it here it stays NULL and the ETA is forever
+                # None — see get_progress, which requires started_at.
+                started_at=datetime.utcnow(),
             )
             session.add(job)
             session.commit()
@@ -72,13 +78,41 @@ class JobQueueManager:
             self.active_jobs[job_id] = {
                 "status": "pending",
                 "processed_photos": 0,
-                "checkpoint_count": 0
+                "checkpoint_count": 0,
+                # Total + finished let process_photo detect when the whole
+                # batch is done and mark the job completed. "finished" counts
+                # every terminal outcome (success, permanent failure, missing
+                # file) so a batch with some failures still completes instead
+                # of hanging in "processing" forever.
+                "total_photos": total_photos,
+                "finished": 0,
             }
             return True
         except Exception as e:
             logger.error("Error creating job %s: %s", job_id, e, exc_info=True)
             return False
     
+    async def _record_finished(self, job_id: str) -> None:
+        """Mark one photo as terminally handled (success OR permanent failure)
+        and, once every photo in the batch has been handled, flush the final
+        count and mark the job completed.
+
+        Without this, the live HTTP path — which fires process_photo tasks
+        fire-and-forget — would never call complete_job, leaving the job
+        stuck in "processing" forever: the progress bar never reaches its
+        terminal state and the WebSocket polls indefinitely. The Orchestrator
+        path already completes jobs explicitly; this makes the direct path
+        behave the same."""
+        job = self.active_jobs.get(job_id)
+        if job is None:
+            return  # cancelled / already completed
+        job["finished"] += 1
+        if job["finished"] >= job.get("total_photos", 0):
+            # Persist the true processed count (the last checkpoint may have
+            # missed the final partial batch) before flipping to completed.
+            await self.save_checkpoint(job_id)
+            await self.complete_job(job_id, success=True)
+
     async def process_photo(self, job_id: str, photo_id: int) -> bool:
         """Process a single photo: extract metadata and generate embedding.
         
@@ -104,6 +138,9 @@ class JobQueueManager:
             file_path = photo.file_path if photo else None
             session.close()
             if not file_path:
+                # Photo row gone — nothing to retry. Count it as handled so
+                # the batch can still reach completion.
+                await self._record_finished(job_id)
                 return False
 
             # Extract metadata from photo file
@@ -143,19 +180,27 @@ class JobQueueManager:
             session.commit()
             session.close()
 
-            # Signal that a new embedding was added (debounced matrix recompute)
+            # Signal that a new embedding was added (debounced index update).
+            # Passing the photo_id lets the index fold it in incrementally
+            # instead of recomputing the whole matrix — see
+            # notify_embeddings_changed / _incremental_add_sync.
             from app.main import notify_embeddings_changed
-            notify_embeddings_changed()
+            notify_embeddings_changed(photo_id)
 
             # Update in-memory tracking
             if job_id in self.active_jobs:
                 self.active_jobs[job_id]["processed_photos"] += 1
-                processed = self.active_jobs[job_id]["processed_photos"]
-                
-                # Check if checkpoint interval reached
-                if processed % self.CHECKPOINT_INTERVAL == 0:
-                    await self.save_checkpoint(job_id)
-            
+                # Persist progress after every photo so the live progress bar
+                # (get_progress reads job.processed_photos from the DB)
+                # advances smoothly instead of jumping in steps of
+                # CHECKPOINT_INTERVAL — and so the final, non-multiple-of-5
+                # count is never lost. save_checkpoint still derives
+                # checkpoint_count / last_checkpoint_at from the running total.
+                await self.save_checkpoint(job_id)
+
+            # Terminal success — may trigger job completion if it was the
+            # last photo in the batch.
+            await self._record_finished(job_id)
             return True
         except Exception as e:
             logger.error(
@@ -176,6 +221,9 @@ class JobQueueManager:
                 session.close()
             except Exception as inner_err:
                 logger.error("Failed to record error state for photo %d: %s", photo_id, inner_err)
+            # Permanent failure for this photo — still counts toward batch
+            # completion so the job doesn't hang in "processing".
+            await self._record_finished(job_id)
             return False
         finally:
             self._processing_semaphore.release()
@@ -308,13 +356,26 @@ class JobQueueManager:
             ).order_by(JobQueue.created_at.desc()).first()
             
             if incomplete_job:
-                print(f"Recovering job {incomplete_job.job_id}: ",
-                      f"{incomplete_job.processed_photos}/{incomplete_job.total_photos} photos processed")
+                # Read every attribute we still need into locals BEFORE the
+                # commit. session.commit() expires the instance's attributes
+                # (expire_on_commit defaults to True) and session.close()
+                # detaches it, so touching incomplete_job.job_id afterwards
+                # raises DetachedInstanceError — which the except below would
+                # swallow, making recovery silently return None and the
+                # "Resume processing" feature never actually resume.
+                recovered_id = incomplete_job.job_id
+                recovered_processed = incomplete_job.processed_photos
+                recovered_checkpoint = incomplete_job.checkpoint_count
+                recovered_total = incomplete_job.total_photos
+                print(f"Recovering job {recovered_id}: ",
+                      f"{recovered_processed}/{recovered_total} photos processed")
                 # Restore job state to in-memory tracking
-                self.active_jobs[incomplete_job.job_id] = {
+                self.active_jobs[recovered_id] = {
                     "status": "processing",
-                    "processed_photos": incomplete_job.processed_photos,
-                    "checkpoint_count": incomplete_job.checkpoint_count
+                    "processed_photos": recovered_processed,
+                    "checkpoint_count": recovered_checkpoint,
+                    "total_photos": recovered_total,
+                    "finished": recovered_processed,
                 }
                 # Update job status to processing
                 incomplete_job.status = "processing"
@@ -322,7 +383,7 @@ class JobQueueManager:
                 incomplete_job.updated_at = datetime.utcnow()
                 session.commit()
                 session.close()
-                return incomplete_job.job_id
+                return recovered_id
             session.close()
             return None
         except Exception as e:

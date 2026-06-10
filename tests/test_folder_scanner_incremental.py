@@ -96,6 +96,42 @@ class TestFolderScannerIncremental:
         assert photos[0].filename == 'test2.jpg'
     
     @pytest.mark.integration
+    def test_scan_does_not_delete_photos_in_other_folders(self, db_session):
+        """Regression: scanning folder A must NOT delete photos belonging to
+        a different registered folder B.
+
+        The deleted-photo cleanup compares disk contents against the DB. It
+        must be scoped to the folder being scanned; otherwise scanning A
+        (whose scanned_paths never include B's files) wipes every Photo row
+        under B — silent, cascading data loss across the user's other
+        registered folders."""
+        folder_a = tempfile.mkdtemp()
+        folder_b = tempfile.mkdtemp()
+        try:
+            img = Image.new('RGB', (100, 100), color='red')
+            img.save(os.path.join(folder_a, 'a.jpg'), 'JPEG')
+            img.save(os.path.join(folder_b, 'b.jpg'), 'JPEG')
+
+            scanner = FolderScanner()
+            scanner.scan_folder(folder_a, db_session)
+            scanner.scan_folder(folder_b, db_session)
+            assert db_session.query(Photo).count() == 2
+
+            # Re-scan A. B's photo is untouched (it lives in a folder we
+            # didn't walk), and A's photo survives because it's still on disk.
+            scanner.scan_folder(folder_a, db_session)
+
+            paths = {p.file_path for p in db_session.query(Photo).all()}
+            assert os.path.join(folder_a, 'a.jpg') in paths
+            assert os.path.join(folder_b, 'b.jpg') in paths, (
+                "scanning folder A deleted folder B's photo — cleanup is not "
+                "scoped to the scanned folder"
+            )
+        finally:
+            shutil.rmtree(folder_a)
+            shutil.rmtree(folder_b)
+
+    @pytest.mark.integration
     def test_no_reprocessing_unchanged_photos(self, temp_folder, db_session):
         """Verify unchanged photos are not queued for reprocessing."""
         img_path = os.path.join(temp_folder, 'test.jpg')

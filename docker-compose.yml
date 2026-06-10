@@ -8,8 +8,11 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: app_db
+    # Only the HOST side of each port mapping is configurable (set in .env).
+    # Containers reach each other over the Docker network on the FIXED internal
+    # ports below, so changing a host port never breaks inter-service wiring.
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,8 +27,8 @@ services:
     image: qdrant/qdrant:latest
     container_name: qdrant_db
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
       - ./qdrant_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
@@ -40,7 +43,7 @@ services:
       dockerfile: Dockerfile
     container_name: fastapi_app
     ports:
-      - "8000:8000"
+      - "${FASTAPI_PORT:-8000}:8000"
     volumes:
       # Bind-mount the user's home dir at the SAME path inside the container.
       # This lets the UI accept any host path under $HOST_HOME/... and the
@@ -52,6 +55,9 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app_db
       QDRANT_URL: http://qdrant:6333
       TRASH_DIR: ${TRASH_DIR:-${HOST_HOME}/.photo-gaze-trash}
+      # Absolute base URL the browser uses to fetch thumbnails — must match the
+      # host-published backend port so links don't 404 when FASTAPI_PORT changes.
+      BACKEND_PUBLIC_URL: http://localhost:${FASTAPI_PORT:-8000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,11 +75,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+      # Baked into the static bundle at build time (the runtime env below is a
+      # no-op for an already-built bundle). Derived from FASTAPI_PORT so the UI
+      # talks to the backend's host-published port.
+      args:
+        REACT_APP_API_URL: http://localhost:${FASTAPI_PORT:-8000}
+        REACT_APP_WS_URL: ws://localhost:${FASTAPI_PORT:-8000}
     container_name: react_app
     ports:
-      - "3000:3000"
-    environment:
-      REACT_APP_API_URL: http://localhost:8000
+      - "${REACT_PORT:-3000}:3000"
     depends_on:
       - fastapi
     healthcheck:
@@ -88,7 +98,7 @@ services:
     image: prom/prometheus:latest
     container_name: prometheus
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -110,7 +120,7 @@ services:
     image: prom/alertmanager:latest
     container_name: alertmanager
     ports:
-      - "9093:9093"
+      - "${ALERTMANAGER_PORT:-9093}:9093"
     volumes:
       - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager_data:/alertmanager
@@ -129,7 +139,7 @@ services:
     image: prom/node-exporter:latest
     container_name: node_exporter
     ports:
-      - "9100:9100"
+      - "${NODE_EXPORTER_PORT:-9100}:9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro

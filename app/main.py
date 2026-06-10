@@ -26,6 +26,12 @@ from app.thumbnail import ThumbnailService
 from app.similarity_search import SimilarityGroupService
 from app.models import Photo
 from app.backup_manager import BackupManager
+from app.validators import (
+    validate_pagination,
+    validate_similarity_filters,
+    validate_photo_id,
+    validate_thumbnail_size,
+)
 from sqlalchemy.orm import sessionmaker
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 import time
@@ -34,9 +40,19 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="App API")
 
+# CORS. The UI's host port is configurable (REACT_PORT in start.sh), so a
+# fixed allowlist breaks the moment someone runs the UI on a non-default port
+# (e.g. 3001 because 3000 was taken) — every browser fetch then fails with an
+# opaque "Failed to fetch". For this self-hosted, single-user tool we instead
+# allow ANY localhost/127.0.0.1 origin on any port via a regex. An explicit
+# extra allowlist can still be supplied via CORS_ORIGINS (comma-separated) for
+# non-localhost deployments.
+_cors_extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_cors_extra,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -314,6 +330,13 @@ async def get_job_queue_status():
 
 
 TRASH_DIR = os.getenv("TRASH_DIR", os.path.expanduser("~/.photo-gaze-trash"))
+
+# Public base URL the BROWSER uses to reach this backend. Thumbnail links in
+# the /similarity-groups payload are absolute (the React app and the backend
+# are served on different host ports), so they must point at the host-published
+# backend port. Configurable so changing FASTAPI_PORT doesn't 404 every
+# thumbnail — docker-compose sets it to http://localhost:${FASTAPI_PORT}.
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000").rstrip("/")
 
 
 # Mime types we prefer to keep when ranking duplicates (universally
@@ -851,7 +874,10 @@ async def _execute_dedupe(session, photo_ids: list) -> dict:
     deleted = session.query(_Photo).filter(_Photo.id.in_(ids_to_purge)).delete(synchronize_session=False)
     session.commit()
 
-    await _recompute_sim_cache()
+    # Incremental cache update — deletion only removes nodes/edges, so we
+    # filter the in-memory index instead of a full Qdrant re-scroll + re-search
+    # (which would block this request for minutes on a 300k-photo collection).
+    _remove_photos_from_cache(set(ids_to_purge))
 
     return {
         "deleted": deleted,
@@ -998,7 +1024,6 @@ def _plan_auto_dedupe(threshold: float, keep_folder: str) -> dict:
         return EMPTY_PLAN
 
     photo_ids = cache_data["photo_ids"]
-    adjacency = cache_data["adjacency"]
     cache_floor = cache_data.get("cache_threshold", _SIM_CACHE_THRESHOLD)
     if threshold >= 1.0:
         # See _PURE_DUPE_EPSILON: float32 normalize-then-dot returns
@@ -1016,51 +1041,25 @@ def _plan_auto_dedupe(threshold: float, keep_folder: str) -> dict:
         if _is_under(meta.get("file_path") or "", keep_abs):
             in_keep_idx.add(idx)
 
-    # Cache adjacency is DIRECTED (each row is the photo's top-k
-    # neighbours from Qdrant). The duplicate relation is mathematically
-    # symmetric — cosine(a,b) == cosine(b,a) — but Qdrant's top_k cap
-    # can drop the back-edge. BFS over directed adjacency would then
-    # miss outsiders whose only edge points INTO an in-keep anchor.
-    # Materialize the symmetric closure once, filtered by threshold.
-    sym_neighbours: list = [set() for _ in range(n)]
-    for i, edges in enumerate(adjacency):
-        for j, s in edges:
-            if s >= effective_threshold:
-                sym_neighbours[i].add(j)
-                sym_neighbours[j].add(i)
-
-    def _component(seed: int) -> set:
-        """BFS over the symmetric neighbour graph from `seed`. Returns
-        the set of indices in the connected component."""
-        seen = {seed}
-        queue = [seed]
-        while queue:
-            cur = queue.pop()
-            for j in sym_neighbours[cur]:
-                if j not in seen:
-                    seen.add(j)
-                    queue.append(j)
-        return seen
-
+    # Connected components of the duplicate graph at this threshold.
+    # _threshold_components symmetrizes (Qdrant's top-k can drop a back-edge,
+    # so an outsider whose only edge points INTO an in-keep anchor is still
+    # captured) and is O(active edges), so this scales to 300k-photo
+    # collections instead of allocating a set per photo. Components are
+    # index-sorted, keeping the plan reproducible. See the regression tests
+    # test_outsider_pure_duplicate_missed_via_asymmetric_adjacency and
+    # test_chain_of_duplicates_outside_keep_all_deleted.
     plan_groups: list = []
     to_delete: list = []
     kept: list = []
-    processed: set = set()
+    skipped = 0
 
-    # First pass: process every component anchored in the keep folder.
-    # Iterating in deterministic order keeps the response reproducible.
-    for i in sorted(in_keep_idx):
-        if i in processed:
-            continue
-        component = _component(i)
-        processed.update(component)
-        if len(component) < 2:
-            continue
+    for component in _threshold_components(cache_data, effective_threshold):
         in_comp = [k for k in component if k in in_keep_idx]
         if not in_comp:
-            # Defensive — pass-1 only seeds from in_keep so this can't
-            # actually happen, but the symmetric BFS construction is
-            # subtle enough that an explicit guard is cheap insurance.
+            # No anchor in the keep folder → never make a destructive choice.
+            # Counted so the UI can report "X groups skipped".
+            skipped += 1
             continue
         # Pick the SINGLE EARLIEST-taken in-keep member as the survivor.
         in_comp_with_keys = sorted(
@@ -1098,20 +1097,6 @@ def _plan_auto_dedupe(threshold: float, keep_folder: str) -> dict:
         })
         kept.extend(m["photo_id"] for m in kept_meta)
         to_delete.extend(m["photo_id"] for m in delete_meta)
-
-    # Second pass: count outsider components (no member in keep folder)
-    # so the UI can report "X groups skipped — they have no anchor in
-    # your keep folder". Singletons are not real clusters and don't
-    # contribute to the count.
-    skipped = 0
-    for i in range(n):
-        if i in processed:
-            continue
-        component = _component(i)
-        processed.update(component)
-        if len(component) < 2:
-            continue
-        skipped += 1
 
     return {
         "groups_processed": len(plan_groups),
@@ -1385,9 +1370,10 @@ async def delete_folder(folder_id: int):
         session.delete(folder)
         session.commit()
 
-        # Immediately recompute similarity matrix after folder deletion
+        # Incrementally drop the removed photos from the similarity index
+        # (O(edges), no full Qdrant re-scroll) — see _remove_photos_from_cache.
         if photo_ids:
-            await _recompute_sim_cache()
+            _remove_photos_from_cache(set(photo_ids))
 
         return {
             "deleted": folder_id,
@@ -1483,6 +1469,11 @@ async def rescan_folder(folder_path: str = None):
 @app.get("/thumbnails/{photo_id}")
 async def get_thumbnail(photo_id: int, size: int = 200):
     """Return a cached thumbnail for the given photo, generating it if needed."""
+    # Reject out-of-range ids/sizes up front (a 0/negative id or a 10000px
+    # "thumbnail" is a client bug, not a 404/500 on our side).
+    err = validate_photo_id(photo_id) or validate_thumbnail_size(size)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     if job_queue_manager is None:
         return JSONResponse(status_code=503, content={"error": "Service not initialized"})
 
@@ -1610,13 +1601,15 @@ def _read_image_info(file_path: str) -> tuple:
 # --------------- Event-driven similarity index cache ---------------
 #
 # Built once eagerly at startup, then refreshed on changes:
-#   - Additions: job_queue calls notify_embeddings_changed() after upsert.
-#     A debounce coalesces rapid additions into a single recompute that
-#     fires 60s after the LAST change in the photo collection — the UI
-#     sees fresh groupings within a minute of the scan going idle, without
-#     paying for a recompute per photo during a long batch.
-#   - Deletions: deduplicate / folder-delete call _recompute_sim_cache()
-#     immediately so the UI reflects user-driven removals right away.
+#   - Additions: job_queue calls notify_embeddings_changed(photo_id) after
+#     upsert. A debounce coalesces rapid additions, then folds just the new
+#     photos in incrementally (_incremental_add_sync) — the UI sees fresh
+#     groupings within a minute of the scan going idle, without re-scrolling
+#     the whole collection.
+#   - Deletions: deduplicate / auto-deduplicate / folder-delete call
+#     _remove_photos_from_cache() immediately — an O(edges) in-memory filter
+#     of just the removed nodes, so the UI reflects removals right away without
+#     a full Qdrant re-scroll.
 #
 # The cache is a SPARSE ADJACENCY index, NOT a dense N×N cosine matrix.
 # At 60k photos a dense matrix is 14.4 GB; the adjacency stores only
@@ -1664,8 +1657,11 @@ def _compute_sim_cache():
           "vectors":      np.ndarray (N, D), unit-normalized,
           "photo_ids":    [int],     index i -> photo_id
           "point_ids":    [str],     index i -> Qdrant point id
-          "adjacency":    [[(j, score), ...]] of length N,
-          "cache_threshold": float,  the floor at which adjacency was built
+          "edge_arrays":  (scores_asc, i_idx, j_idx) numpy arrays — the
+                          score-sorted undirected edge index used for O(active)
+                          threshold clustering (see _threshold_components),
+          "max_effective_size": float,  quality-score denominator,
+          "cache_threshold": float,  the floor at which edges were built
         }
 
     Memory at 60k photos with ~20 neighbours each: ~92 MB vectors + ~10 MB
@@ -1763,7 +1759,17 @@ def _compute_sim_cache():
         "vectors": vecs,
         "photo_ids": photo_ids,
         "point_ids": point_ids,
-        "adjacency": adjacency,
+        # Score-sorted undirected edge index — the ONLY edge structure kept in
+        # steady state. We build the directed `adjacency` locally above only to
+        # derive this, then let it go: at 300k photos the list-of-lists-of-
+        # tuples is hundreds of MB, while these three numpy arrays are tens of
+        # MB and are all the hot paths (clustering, auto-dedupe) need.
+        "edge_arrays": _edges_from_adjacency(adjacency),
+        # Quality-score denominator, precomputed so the slider hot path never
+        # scans all N photo metas.
+        "max_effective_size": max(
+            (_effective_size(m) for m in photo_meta.values()), default=0.0
+        ),
         "cache_threshold": _SIM_CACHE_THRESHOLD,
     }
     return cache_data, photo_meta
@@ -1781,7 +1787,7 @@ async def _recompute_sim_cache():
             cache_data, photo_meta = await loop.run_in_executor(None, _compute_sim_cache)
             _sim_cache.update(data=cache_data, meta=photo_meta)
             n_vecs = len(cache_data["photo_ids"]) if cache_data else 0
-            n_edges = sum(len(adj) for adj in cache_data["adjacency"]) if cache_data else 0
+            n_edges = int(cache_data["edge_arrays"][0].size) if cache_data else 0
             _sim_index_info.update(
                 last_recompute_at=datetime.utcnow().isoformat(),
                 last_recompute_duration_ms=int((time.time() - t0) * 1000),
@@ -1796,12 +1802,25 @@ async def _recompute_sim_cache():
             _sim_index_info["recompute_running"] = False
 
 
-def notify_embeddings_changed():
-    """Call after an embedding is added/updated. Debounces: recomputes the
-    matrix once after _SIM_DEBOUNCE_SECONDS of no further changes, so a long
-    batch scan triggers a single recompute when it finishes idle, not one
-    per photo."""
+# Photo IDs embedded since the last index update, accumulated by
+# notify_embeddings_changed and drained by the debounced _apply_pending_changes.
+# Lets a scan's worth of additions be folded into the index incrementally
+# (search only the new vectors) instead of re-scrolling all N vectors.
+_pending_new_pids: set = set()
+
+
+def notify_embeddings_changed(photo_id: Optional[int] = None):
+    """Call after an embedding is added/updated. Debounces: folds the changes
+    into the index once after _SIM_DEBOUNCE_SECONDS of quiet, so a long batch
+    scan triggers a single update when it finishes idle, not one per photo.
+
+    Pass the photo_id so the update can be INCREMENTAL — only the new photos
+    are searched and merged in (O(new) Qdrant searches), which is what keeps a
+    scan cheap when the existing collection holds 300k photos. Called with no
+    id, it falls back to a full recompute."""
     global _sim_debounce_handle
+    if photo_id is not None:
+        _pending_new_pids.add(photo_id)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1812,8 +1831,51 @@ def notify_embeddings_changed():
         _sim_debounce_handle.cancel()
     _sim_debounce_handle = loop.call_later(
         _SIM_DEBOUNCE_SECONDS,
-        lambda: asyncio.ensure_future(_recompute_sim_cache()),
+        lambda: asyncio.ensure_future(_apply_pending_changes()),
     )
+
+
+async def _apply_pending_changes():
+    """Debounce callback: incrementally add the photos accumulated since the
+    last update, or fall back to a full recompute when there's no base index
+    yet (cold start) or no specific additions were recorded."""
+    global _pending_new_pids
+    pending = _pending_new_pids
+    _pending_new_pids = set()
+
+    if _sim_cache.get("data") is None or not pending:
+        await _recompute_sim_cache()
+        return
+
+    need_full_fallback = False
+    async with _get_recompute_lock():
+        loop = asyncio.get_running_loop()
+        _sim_index_info["recompute_running"] = True
+        t0 = time.time()
+        try:
+            cache_data, photo_meta = await loop.run_in_executor(
+                None, _incremental_add_sync, pending
+            )
+            if cache_data is None:
+                need_full_fallback = True
+            else:
+                _sim_cache.update(data=cache_data, meta=photo_meta)
+                _sim_index_info.update(
+                    last_recompute_at=datetime.utcnow().isoformat(),
+                    last_recompute_duration_ms=int((time.time() - t0) * 1000),
+                    vectors_in_index=len(cache_data["photo_ids"]),
+                    edges_in_index=int(cache_data["edge_arrays"][0].size),
+                )
+        except Exception as e:
+            logger.warning("Incremental index add failed (%s); full rebuild.", e)
+            need_full_fallback = True
+        finally:
+            _sim_index_info["recompute_running"] = False
+
+    # Fallback OUTSIDE the lock — _recompute_sim_cache reacquires it and the
+    # asyncio lock is not reentrant.
+    if need_full_fallback:
+        await _recompute_sim_cache()
 
 
 def _get_cached_data():
@@ -1829,6 +1891,349 @@ def _get_cached_data():
 
 
 _PURE_DUPE_EPSILON = 1e-4  # float32 normalize-then-dot noise floor
+
+
+def _effective_size(meta: dict) -> float:
+    """File size with the same +20% bonus for universally-decodable formats
+    (JPEG/PNG) that _best_key uses. Keeps the quality score monotonic with
+    the keeper ranking, so the photo we mark "Best" is also the highest
+    quality in its group."""
+    size = float(meta.get("file_size") or 0)
+    if meta.get("mime_type") in _PREFERRED_MIME_TYPES:
+        return size * 1.2
+    return size
+
+
+def _quality_score(meta: dict, max_effective_size: float) -> float:
+    """A cross-group-comparable photo quality in [0, 1].
+
+    Derived from file size (a proxy for detail / low compression) normalized
+    by the largest effective size in the whole collection, so the single
+    highest-quality photo scores ~1.0 and everything else scales beneath it.
+    This is data-driven (no magic byte threshold) and uses only fields
+    already in the in-memory cache, so it stays off the slider's hot path.
+
+    Replaces the old hard-coded 0.8 that made `min_quality` and
+    `sort_by=quality` no-ops and left the frontend quality badges blank.
+    """
+    if max_effective_size <= 0:
+        return 0.0
+    return round(min(1.0, _effective_size(meta) / max_effective_size), 4)
+
+
+# ---- Scalable clustering primitives (200k–300k photo collections) ----
+#
+# The cache's per-photo `adjacency` (list of lists of (j, score)) is great for
+# the cold build but a poor shape for the per-slider-tick hot path: clustering
+# from it meant allocating N empty sets and scanning every edge on EVERY tick,
+# i.e. O(N + E) regardless of threshold. At 300k photos / millions of edges
+# that makes the slider lag for seconds.
+#
+# Instead we collapse the adjacency once into a flat, score-SORTED, undirected,
+# de-duplicated edge index stored as three parallel numpy arrays. Then a tick
+# at threshold t is:
+#   - np.searchsorted to find the active suffix (edges with score >= t)   O(logE)
+#   - build adjacency only for the nodes touched by those edges + BFS    O(active)
+# At the high thresholds dedup actually uses (0.9–1.0) the active set is tiny,
+# so a tick is near-instant even on a 300k collection.
+
+
+def _edges_from_adjacency(adjacency: list):
+    """Collapse the directed per-photo adjacency into score-sorted, undirected,
+    de-duplicated edge arrays. Symmetrizes (Qdrant's top-k can drop a back-edge)
+    by keeping the max score seen for each unordered pair. Returns
+    (scores_ascending, i_idx, j_idx) as numpy arrays. Computed once per cache."""
+    pair_max: Dict[tuple, float] = {}
+    for i, edges in enumerate(adjacency):
+        for j, s in edges:
+            if i == j:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            prev = pair_max.get((a, b))
+            if prev is None or s > prev:
+                pair_max[(a, b)] = s
+    if not pair_max:
+        empty_f = np.empty(0, dtype=np.float64)
+        empty_i = np.empty(0, dtype=np.int32)
+        return empty_f, empty_i.copy(), empty_i.copy()
+    items = sorted(pair_max.items(), key=lambda kv: kv[1])  # ascending by score
+    m = len(items)
+    # float64 (not 32): scores are compared against the request threshold via
+    # searchsorted, and float32 rounding of e.g. 0.9999 drifts just below the
+    # threshold and would wrongly drop a pure-duplicate edge. The source
+    # adjacency already holds float64 cosines, so this is lossless.
+    scores = np.fromiter((s for _, s in items), dtype=np.float64, count=m)
+    i_idx = np.fromiter((p[0] for p, _ in items), dtype=np.int32, count=m)
+    j_idx = np.fromiter((p[1] for p, _ in items), dtype=np.int32, count=m)
+    return scores, i_idx, j_idx
+
+
+def _get_edge_arrays(cache_data: dict):
+    """Return the cached (scores, i, j) edge arrays, deriving + memoizing them
+    from `adjacency` on first use. Production builds them eagerly in
+    _compute_sim_cache (cold path); the unit-test cache only sets `adjacency`,
+    so this lazily fills them in."""
+    ea = cache_data.get("edge_arrays")
+    if ea is not None:
+        return ea
+    ea = _edges_from_adjacency(cache_data.get("adjacency") or [])
+    cache_data["edge_arrays"] = ea
+    return ea
+
+
+def _threshold_components(cache_data: dict, threshold: float) -> list:
+    """Connected components (size >= 2) of the duplicate graph at `threshold`.
+
+    O(active edges) — independent of collection size — via a searchsorted slice
+    of the precomputed score-sorted edge index. Components and their members
+    are returned in a deterministic (index-sorted) order so callers that build
+    user-facing plans stay reproducible."""
+    scores, i_idx, j_idx = _get_edge_arrays(cache_data)
+    if scores.size == 0:
+        return []
+    lo = int(np.searchsorted(scores, threshold, side="left"))  # first >= threshold
+    if lo >= scores.size:
+        return []
+    # tolist() is markedly faster than per-element numpy indexing in the loop.
+    us = i_idx[lo:].tolist()
+    vs = j_idx[lo:].tolist()
+
+    adj: Dict[int, list] = {}
+    for u, v in zip(us, vs):
+        adj.setdefault(u, []).append(v)
+        adj.setdefault(v, []).append(u)
+
+    visited: set = set()
+    components: list = []
+    for start in adj:
+        if start in visited:
+            continue
+        visited.add(start)
+        comp = [start]
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            for nb in adj[cur]:
+                if nb not in visited:
+                    visited.add(nb)
+                    comp.append(nb)
+                    stack.append(nb)
+        if len(comp) >= 2:
+            comp.sort()
+            components.append(comp)
+    components.sort(key=lambda c: c[0])
+    return components
+
+
+def _merge_new_edges(existing_arrays, new_directed_edges):
+    """Merge freshly-discovered directed edges into the score-sorted edge
+    index. Used by incremental add.
+
+    `new_directed_edges` is a list of (i, j, score) where at least one endpoint
+    is a brand-new node index (>= the old node count). Because every new edge
+    touches a new index and existing edges only connect old indices, the two
+    sets are DISJOINT — so we just de-duplicate the new directed edges into
+    undirected pairs (keeping the max score for each), concatenate, and re-sort
+    ascending. Returns new (scores, i, j) arrays."""
+    scores, ii, jj = existing_arrays
+    pair_max: Dict[tuple, float] = {}
+    for a, b, s in new_directed_edges:
+        if a == b:
+            continue
+        key = (a, b) if a < b else (b, a)
+        prev = pair_max.get(key)
+        if prev is None or s > prev:
+            pair_max[key] = s
+    if not pair_max:
+        return existing_arrays
+    m = len(pair_max)
+    ns = np.fromiter(pair_max.values(), dtype=np.float64, count=m)
+    ni = np.fromiter((k[0] for k in pair_max), dtype=np.int32, count=m)
+    nj = np.fromiter((k[1] for k in pair_max), dtype=np.int32, count=m)
+    all_s = np.concatenate([scores, ns])
+    all_i = np.concatenate([ii, ni])
+    all_j = np.concatenate([jj, nj])
+    order = np.argsort(all_s, kind="stable")  # ascending, as production expects
+    return all_s[order], all_i[order].astype(np.int32), all_j[order].astype(np.int32)
+
+
+def _incremental_add_sync(new_pids: set):
+    """Add newly-embedded photos to the in-memory index WITHOUT a full rebuild.
+
+    Searches ONLY the new vectors against Qdrant (O(new · top_k)) and merges
+    their edges in, instead of scrolling all N vectors and running N HNSW
+    searches. This is what makes a scan of a few hundred new photos cheap even
+    when the existing collection holds 300k.
+
+    Returns the updated (cache_data, photo_meta), or (None, None) to tell the
+    caller to fall back to a full recompute (cold cache, missing client, or any
+    unexpected shape — correctness over cleverness)."""
+    from app.models import Embedding as _Emb, Photo as _Photo
+
+    base = _sim_cache.get("data")
+    meta = _sim_cache.get("meta")
+    qc = job_queue_manager.qdrant_client if job_queue_manager else None
+    if not base or meta is None or qc is None:
+        return None, None
+
+    existing = set(base["photo_ids"])
+    add_pids = [p for p in new_pids if p not in existing]
+    if not add_pids:
+        return base, meta  # all already indexed (e.g. duplicate notify)
+
+    # 1) point_ids + metadata for the new photos, from Postgres.
+    session = job_queue_manager.SessionLocal()
+    try:
+        pid_to_point = {
+            pid: pt for pid, pt in (
+                session.query(_Emb.photo_id, _Emb.qdrant_point_id)
+                .filter(_Emb.photo_id.in_(add_pids))
+                .filter(_Emb.qdrant_point_id.isnot(None))
+                .all()
+            )
+        }
+        meta_rows = (
+            session.query(_Photo.id, _Photo.filename, _Photo.file_path,
+                          _Photo.file_size, _Photo.mime_type, _Photo.uploaded_at)
+            .filter(_Photo.id.in_(add_pids)).all()
+        )
+    finally:
+        session.close()
+    new_meta = {
+        r[0]: {"filename": r[1], "file_path": r[2], "file_size": r[3],
+               "mime_type": r[4], "uploaded_at": r[5].isoformat() if r[5] else None}
+        for r in meta_rows
+    }
+    add_pids = [p for p in add_pids if p in pid_to_point and p in new_meta]
+    if not add_pids:
+        return base, meta
+
+    # 2) Retrieve the new vectors from Qdrant.
+    point_ids = [pid_to_point[p] for p in add_pids]
+    records = qc.retrieve(collection_name="embeddings", ids=point_ids, with_vectors=True)
+    vec_by_point = {rec.id: rec.vector for rec in records if rec.vector is not None}
+    add_pids = [p for p in add_pids if pid_to_point[p] in vec_by_point]
+    if not add_pids:
+        return base, meta
+    point_ids = [pid_to_point[p] for p in add_pids]
+    raw = np.array([vec_by_point[pt] for pt in point_ids], dtype=np.float32)
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    new_vecs = raw / norms
+
+    # 3) Combined node arrays (old photos first, then the new ones).
+    old_ids = base["photo_ids"]
+    old_n = len(old_ids)
+    combined_ids = list(old_ids) + add_pids
+    pid_to_idx = {pid: i for i, pid in enumerate(combined_ids)}
+    base_vecs = base["vectors"]
+    combined_vectors = (
+        np.vstack([base_vecs, new_vecs]) if getattr(base_vecs, "size", 0) else new_vecs
+    )
+
+    # 4) Search only the new vectors for neighbours above the cache floor.
+    from qdrant_client.http.models import SearchRequest
+    floor = base.get("cache_threshold", _SIM_CACHE_THRESHOLD)
+    requests = [
+        SearchRequest(vector=new_vecs[k].tolist(), limit=_SIM_TOP_K + 1,
+                      score_threshold=floor, with_payload=True)
+        for k in range(len(add_pids))
+    ]
+    new_directed = []
+    for k, hits in enumerate(qc.search_batch(collection_name="embeddings", requests=requests)):
+        i = old_n + k
+        for hit in hits:
+            hpid = int(hit.payload.get("photo_id", 0)) if hit.payload else 0
+            j = pid_to_idx.get(hpid)
+            if j is None or j == i:
+                continue
+            new_directed.append((i, j, float(hit.score)))
+
+    new_edges = _merge_new_edges(_get_edge_arrays(base), new_directed)
+
+    merged_meta = dict(meta)
+    merged_meta.update(new_meta)
+    new_max = max(
+        base.get("max_effective_size", 0.0),
+        max((_effective_size(m) for m in new_meta.values()), default=0.0),
+    )
+    new_data = {
+        "vectors": combined_vectors,
+        "photo_ids": combined_ids,
+        "point_ids": list(base.get("point_ids") or []) + point_ids,
+        "edge_arrays": new_edges,
+        "max_effective_size": new_max,
+        "cache_threshold": floor,
+    }
+    return new_data, merged_meta
+
+
+def _remove_photos_from_cache(deleted_pids: set) -> None:
+    """Drop photo_ids from the in-memory similarity cache WITHOUT a full
+    rebuild. Deletion only removes nodes/edges, so the surviving index is a
+    pure subset — we filter it in O(current edges) with numpy instead of
+    scrolling every vector out of Qdrant and re-running N HNSW searches.
+
+    That full recompute is what /deduplicate, /auto-deduplicate and
+    folder-delete used to await synchronously; on a 300k-photo collection it
+    blocks the request for minutes just to remove a handful of duplicates. The
+    next scan-triggered recompute still rebuilds from Qdrant, so this is a fast,
+    correct interim update. No-op if the cache isn't built yet."""
+    data = _sim_cache.get("data")
+    if not data or not deleted_pids:
+        return
+    photo_ids = data["photo_ids"]
+    n = len(photo_ids)
+    # old index -> new index (-1 = removed), as a numpy lookup for vectorized
+    # edge remapping.
+    old_to_new = np.full(n, -1, dtype=np.int64)
+    new_photo_ids = []
+    new_point_ids = []
+    point_ids = data.get("point_ids") or []
+    for old in range(n):
+        if photo_ids[old] in deleted_pids:
+            continue
+        old_to_new[old] = len(new_photo_ids)
+        new_photo_ids.append(photo_ids[old])
+        if old < len(point_ids):
+            new_point_ids.append(point_ids[old])
+    if len(new_photo_ids) == n:
+        return  # nothing actually removed
+
+    vectors = data["vectors"]
+    new_vectors = vectors[old_to_new >= 0] if getattr(vectors, "size", 0) else vectors
+
+    scores, ii, jj = _get_edge_arrays(data)
+    if scores.size:
+        ni = old_to_new[ii]
+        nj = old_to_new[jj]
+        mask = (ni >= 0) & (nj >= 0)            # keep edges with both ends alive
+        new_edges = (scores[mask], ni[mask].astype(np.int32), nj[mask].astype(np.int32))
+    else:
+        new_edges = (scores, ii, jj)
+
+    meta = _sim_cache.get("meta") or {}
+    for pid in deleted_pids:
+        meta.pop(pid, None)
+
+    _sim_cache.update(
+        data={
+            "vectors": new_vectors,
+            "photo_ids": new_photo_ids,
+            "point_ids": new_point_ids,
+            "adjacency": [],  # superseded by edge_arrays
+            "edge_arrays": new_edges,
+            "max_effective_size": max(
+                (_effective_size(m) for m in meta.values()), default=0.0
+            ),
+            "cache_threshold": data.get("cache_threshold", _SIM_CACHE_THRESHOLD),
+        },
+        meta=meta,
+    )
+    _sim_index_info.update(
+        vectors_in_index=len(new_photo_ids),
+        edges_in_index=int(new_edges[0].size),
+    )
 
 
 def _build_similarity_groups_from_qdrant(threshold: float):
@@ -1855,51 +2260,45 @@ def _build_similarity_groups_from_qdrant(threshold: float):
 
     vectors = cache_data["vectors"]
     photo_ids = cache_data["photo_ids"]
-    adjacency = cache_data["adjacency"]
     cache_floor = cache_data.get("cache_threshold", _SIM_CACHE_THRESHOLD)
     if threshold >= 1.0:
         threshold = 1.0 - _PURE_DUPE_EPSILON
     effective_threshold = max(threshold, cache_floor)
-    n = len(photo_ids)
 
-    visited = set()
+    # Largest effective file size across the whole collection — the
+    # denominator that makes per-photo quality scores comparable between
+    # groups. Memoized on the cache: scanning all photo_meta is O(N), which
+    # must NOT happen on every slider tick at 300k photos. _compute_sim_cache
+    # fills it eagerly; this is the lazy fallback for hand-built test caches.
+    max_effective_size = cache_data.get("max_effective_size")
+    if max_effective_size is None:
+        max_effective_size = max(
+            (_effective_size(m) for m in (photo_meta or {}).values()),
+            default=0.0,
+        )
+        cache_data["max_effective_size"] = max_effective_size
+
+    # Cluster by connected components over the duplicate graph. This is
+    # transitive-correct (A~B, B~C ⇒ {A,B,C}, even if A≁C) and identical to
+    # what _plan_auto_dedupe uses, so the groups shown here match what
+    # auto-dedupe acts on. _threshold_components is O(active edges) via a
+    # sorted edge index, so this stays fast on 300k-photo collections even
+    # though it runs on every threshold-slider tick.
     groups = []
-
-    for i in range(n):
-        if i in visited:
-            continue
-        # Filter the precomputed neighbours of i down to the effective threshold.
-        seed_neighbours = [(j, s) for j, s in adjacency[i] if s >= effective_threshold]
-        if not seed_neighbours:
-            visited.add(i)
-            continue
-
-        # Greedy cluster: seed i + any neighbour not already in another group.
-        candidate_idx = [i] + [j for j, _ in seed_neighbours]
-        cluster_idx = [j for j in candidate_idx if j == i or j not in visited]
-        if len(cluster_idx) < 2:
-            visited.add(i)
-            continue
-
-        # Hot path: this loop runs on EVERY threshold-slider tick. Keep it
-        # to in-memory dict lookups only — NO disk I/O. We used to call
-        # _read_image_info(fpath) (PIL EXIF parse, ~5ms cold per file)
-        # plus os.path.isfile per member, which made dragging the slider
-        # take seconds on collections of more than a few hundred photos
-        # whose files weren't yet warmed in the LRU cache. Width / height
-        # / created_date are loaded on-demand by the lightbox via
-        # /photos/{id}/image-info instead — see get_photo_image_info.
+    for component in _threshold_components(cache_data, effective_threshold):
+        # Width / height / created_date are loaded on-demand by the lightbox
+        # via /photos/{id}/image-info — kept out of this hot path.
         members = []
-        for j in cluster_idx:
-            visited.add(j)
+        for j in component:
             pid = photo_ids[j]
             meta = photo_meta.get(pid) or {}
             members.append({
                 "_idx": j,
                 "photo_id": pid,
                 "filename": meta.get("filename") or str(pid),
-                "path": f"http://localhost:8000/thumbnails/{pid}",
+                "path": f"{BACKEND_PUBLIC_URL}/thumbnails/{pid}",
                 "similarity_score": 0.0,  # placeholder, recomputed below
+                "quality_score": _quality_score(meta, max_effective_size),
                 "file_size": meta.get("file_size"),
                 "file_path": meta.get("file_path"),
                 "mime_type": meta.get("mime_type"),
@@ -1968,7 +2367,9 @@ def _build_similarity_groups_from_qdrant(threshold: float):
         groups.append({
             "group_id": f"grp-{ref_pid}",
             "similarity_score": avg_sim,
-            "quality_score": 0.8,
+            # Group quality = the kept ("Best") photo's quality, i.e. the
+            # highest in the group. min_quality filters on this.
+            "quality_score": ref.get("quality_score", 0.0),
             "reference_photo": ref,
             "similar_photos": others,
             "best_reasons": reasons,
@@ -1985,6 +2386,19 @@ async def list_similarity_groups(
     sort_by: Optional[str] = None,
 ):
     """List similarity groups with pagination, filtering, and sorting."""
+    # Reject malformed pagination / filter values instead of silently
+    # mis-behaving (a negative skip slices from the end of the list; an
+    # out-of-range min_similarity quietly returns nothing).
+    err = validate_pagination(skip, limit)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    if min_similarity is not None or min_quality is not None:
+        err = validate_similarity_filters(
+            min_similarity if min_similarity is not None else 0.0,
+            min_quality if min_quality is not None else 0.0,
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
     # min_similarity is the clustering threshold: a pair appears together
     # iff cos(a,b) >= min_similarity. We do NOT additionally filter on the
     # group's avg-to-reference similarity afterwards — that would silently
@@ -2011,8 +2425,23 @@ async def list_similarity_groups(
 
 @app.get("/similarity-groups/{group_id}")
 async def get_similarity_group_detail(group_id: str):
-    """Get a similarity group by ID with thumbnail paths for each member."""
+    """Get a similarity group by ID with thumbnail paths for each member.
+
+    The in-memory similarity_group_service is not populated by the running
+    app — the list endpoint builds groups on the fly from the Qdrant cache.
+    So before giving up with a 404 we rebuild the live groups and look for a
+    match. Without this fallback this endpoint could only ever 404 in
+    production (the store is empty), even for groups the list endpoint
+    happily returns. group_id is "grp-{reference_photo_id}" (see
+    _build_similarity_groups_from_qdrant)."""
     group = similarity_group_service.get_group(group_id)
+    if group is None:
+        # Rebuild at the cache floor so the broadest grouping is searched —
+        # the detail route carries no threshold of its own.
+        for g in _build_similarity_groups_from_qdrant(_SIM_CACHE_THRESHOLD):
+            if g.get("group_id") == group_id:
+                group = g
+                break
     if group is None:
         raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
 

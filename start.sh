@@ -18,6 +18,23 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ─────────────────────────────────────────────────────────────────────────
+# HOST PORTS — edit a number here if it's already in use on your machine.
+# Only the HOST side changes; the containers still talk to each other over the
+# Docker network on fixed internal ports, so the stack keeps working. Changing
+# FASTAPI_PORT also rebuilds the React UI to point at the new backend port.
+# (You can also override one for a single run, e.g.  REACT_PORT=3007 ./start.sh)
+# ─────────────────────────────────────────────────────────────────────────
+export REACT_PORT="${REACT_PORT:-3001}"               # Web UI       (3000 was taken)
+export FASTAPI_PORT="${FASTAPI_PORT:-8000}"           # Backend API
+export POSTGRES_PORT="${POSTGRES_PORT:-5433}"         # Postgres     (5432 was taken)
+export QDRANT_PORT="${QDRANT_PORT:-6333}"             # Qdrant REST + dashboard
+export QDRANT_GRPC_PORT="${QDRANT_GRPC_PORT:-6334}"   # Qdrant gRPC
+export PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
+export ALERTMANAGER_PORT="${ALERTMANAGER_PORT:-9093}"
+export NODE_EXPORTER_PORT="${NODE_EXPORTER_PORT:-9100}"
+# ─────────────────────────────────────────────────────────────────────────
+
 COMPOSE=(docker compose)
 
 case "${1:-}" in
@@ -75,6 +92,9 @@ if [ ! -d "$HOST_HOME" ]; then
 fi
 echo "Using HOST_HOME=$HOST_HOME"
 
+# Host ports are set + exported at the top of this script (edit them there).
+echo "Host ports — UI:$REACT_PORT API:$FASTAPI_PORT Qdrant:$QDRANT_PORT Postgres:$POSTGRES_PORT Prometheus:$PROMETHEUS_PORT Alertmanager:$ALERTMANAGER_PORT"
+
 echo "Bringing the stack up (this pulls images and builds on first run)..."
 "${COMPOSE[@]}" up -d $BUILD_FLAG
 
@@ -82,7 +102,7 @@ echo "Bringing the stack up (this pulls images and builds on first run)..."
 # DINOv2 model (~90MB for vits14) so give it some room.
 echo -n "Waiting for fastapi to become healthy"
 for _ in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 http://localhost:8000/health 2>/dev/null || echo 000)
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://localhost:${FASTAPI_PORT}/health" 2>/dev/null || echo 000)
   if [ "$code" = "200" ]; then
     echo
     echo "fastapi is healthy."
@@ -97,17 +117,17 @@ if [ "${code:-000}" != "200" ]; then
 fi
 
 # Sanity-check react
-react_code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 http://localhost:3000/ 2>/dev/null || echo 000)
+react_code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://localhost:${REACT_PORT}/" 2>/dev/null || echo 000)
 echo "react HTTP code: $react_code"
 
 cat <<EOF
 
 Stack is up. URLs:
-  - UI:           http://localhost:3000
-  - Backend API:  http://localhost:8000 (try /health, /stats, /folders)
-  - Qdrant UI:    http://localhost:6333/dashboard
-  - Prometheus:   http://localhost:9090
-  - Alertmanager: http://localhost:9093
+  - UI:           http://localhost:${REACT_PORT}
+  - Backend API:  http://localhost:${FASTAPI_PORT} (try /health, /stats, /folders)
+  - Qdrant UI:    http://localhost:${QDRANT_PORT}/dashboard
+  - Prometheus:   http://localhost:${PROMETHEUS_PORT}
+  - Alertmanager: http://localhost:${ALERTMANAGER_PORT}
 
 Register a photo folder from the UI ("Photo Folders" panel), then hit
 "Scan" to start embedding generation. Progress is visible in the

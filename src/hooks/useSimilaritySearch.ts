@@ -26,10 +26,10 @@ export function useSimilaritySearch(
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    if (!jobId) {
-      setGroups([]);
-      return;
-    }
+    // Similarity groups are global (the backend's /similarity-groups ignores
+    // jobId), so always load them — don't bail when there's no active job.
+    // jobId stays in the dependency list only so a freshly-finished scan
+    // refreshes the list.
 
     // Cancel any in-flight request
     if (abortRef.current) abortRef.current.abort();

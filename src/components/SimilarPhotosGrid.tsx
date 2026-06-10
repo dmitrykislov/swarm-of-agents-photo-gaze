@@ -69,13 +69,10 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
     return 'quality-poor';
   };
 
-  if (!jobId) {
-    return (
-      <div className="similar-photos-container">
-        <p>No job selected. Process a job to view similar photos.</p>
-      </div>
-    );
-  }
+  // NOTE: similarity groups are GLOBAL — they come from the whole embedding
+  // index, not a specific job. So we do NOT gate the view on an active jobId
+  // (which is empty after a page reload); duplicates stay visible whenever the
+  // index has them. The empty-state below covers "index has no groups yet".
 
   if (loading) {
     return (

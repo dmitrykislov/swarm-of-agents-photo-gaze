@@ -1,6 +1,13 @@
 # Build stage: compile React application
 FROM --platform=linux/arm64 node:18-alpine AS builder
 WORKDIR /app
+# Backend URLs are baked into the static bundle at build time (vite.config.ts
+# reads these from the environment). docker-compose passes them derived from
+# FASTAPI_PORT so the UI points at the backend's host-published port.
+ARG REACT_APP_API_URL=http://localhost:8000
+ARG REACT_APP_WS_URL=ws://localhost:8000
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+ENV REACT_APP_WS_URL=$REACT_APP_WS_URL
 COPY package*.json ./
 # Install dependencies with npm ci for reproducible builds
 RUN npm install

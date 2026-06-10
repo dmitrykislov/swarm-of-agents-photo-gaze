@@ -179,33 +179,55 @@ class FolderScanner:
                     print(f"Error processing file {file_path}: {e}")
                     continue
         
-        # Detect and remove deleted photos
-        deleted_count = self._cleanup_deleted_photos(session, scanned_paths)
+        # Detect and remove deleted photos. Scoped to THIS folder — see
+        # _cleanup_deleted_photos for why passing folder_path is mandatory.
+        deleted_count = self._cleanup_deleted_photos(session, scanned_paths, folder_path)
         if deleted_count > 0:
             print(f"Removed {deleted_count} deleted photos from database")
         
         session.commit()
         return photo_ids, total_count
     
-    def _cleanup_deleted_photos(self, session: Session, scanned_paths: Set[str]) -> int:
-        """Remove photos from database that no longer exist on disk.
-        
+    def _cleanup_deleted_photos(
+        self, session: Session, scanned_paths: Set[str], folder_path: str
+    ) -> int:
+        """Remove photos that live UNDER ``folder_path`` but were not found
+        on disk during this scan (i.e. the user deleted them).
+
+        Scoping to ``folder_path`` is essential. ``scanned_paths`` only
+        contains files discovered under the folder we just walked. If we
+        compared every Photo row in the database against it — as an earlier
+        version did — then scanning one registered folder would delete the
+        Photo (and, via cascade, ProcessingState + Embedding) rows of every
+        OTHER registered folder, because their paths legitimately aren't in
+        this scan's results. That is silent data loss: the user's other
+        folders vanish from the index until re-scanned. See the regression
+        test test_scan_does_not_delete_photos_in_other_folders.
+
         Args:
             session: SQLAlchemy session for database operations
-            scanned_paths: Set of file paths found during folder scan
-        
+            scanned_paths: Set of file paths found during this folder scan
+            folder_path: Root of the folder that was just scanned
+
         Returns:
             Count of deleted photo records
         """
-        all_photos = session.query(Photo).all()
+        folder_abs = os.path.abspath(folder_path)
+        # Trailing separator so /photos/a is not treated as a prefix of
+        # /photos/abc.
+        folder_prefix = folder_abs.rstrip(os.sep) + os.sep
+
         deleted_count = 0
-        
-        for photo in all_photos:
+        for photo in session.query(Photo).all():
+            photo_abs = os.path.abspath(photo.file_path)
+            under_folder = photo_abs == folder_abs or photo_abs.startswith(folder_prefix)
+            if not under_folder:
+                continue  # belongs to a different folder — never touch it
             if photo.file_path not in scanned_paths:
-                # Photo no longer exists on disk; remove it
+                # File is under this folder but gone from disk; remove it.
                 session.delete(photo)
                 deleted_count += 1
-        
+
         return deleted_count
     
     def _get_mime_type(self, file_ext: str) -> str:

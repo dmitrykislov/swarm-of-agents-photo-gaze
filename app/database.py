@@ -23,7 +23,11 @@ def init_db():
 
 
 def init_qdrant_collection():
-    """Initialize Qdrant collection with 1024-dimensional vectors if it doesn't exist."""
+    """Initialize the Qdrant collection if it doesn't exist.
+
+    Vectors are 384-dimensional to match DINOv2 ViT-S/14 (see
+    EmbeddingGenerator.embedding_dim). Do NOT change this to 1024 without
+    also swapping the model — a mismatch makes every upsert fail."""
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name = "embeddings"
     vector_size = 384
