@@ -56,3 +56,6 @@ done-tasks.md
 
 # Local, never-committed planning/scratch docs
 .local/
+
+# Exported ONNX model (regenerate via scripts/export_dinov2_onnx.py)
+models/

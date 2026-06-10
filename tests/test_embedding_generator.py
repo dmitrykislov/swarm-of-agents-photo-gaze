@@ -41,8 +41,8 @@ class TestEmbeddingGenerator:
     def test_model_initialization(self, generator):
         """Verify DINOv2 model loads successfully."""
         assert generator.model is not None
-        assert generator.model_name == 'dinov2_vitl14'
-        assert generator.embedding_dim == 1024
+        assert generator.model_name == 'dinov2_vits14'
+        assert generator.embedding_dim == 384
     
     @pytest.mark.unit
     def test_model_device_detection(self):
@@ -54,16 +54,16 @@ class TestEmbeddingGenerator:
     def test_get_model_info(self, generator):
         """Verify model metadata is accessible."""
         info = generator.get_model_info()
-        assert info['model_name'] == 'dinov2_vitl14'
-        assert info['embedding_dim'] == 1024
+        assert info['model_name'] == 'dinov2_vits14'
+        assert info['embedding_dim'] == 384
         assert info['device'] == 'cpu'
     
     @pytest.mark.unit
     def test_generate_embedding_returns_correct_dimension(self, generator, sample_image_bytes):
-        """Verify single image embedding has correct dimension (1024)."""
+        """Verify single image embedding has correct dimension (384)."""
         embedding, confidence = generator.generate_embedding(sample_image_bytes)
         assert isinstance(embedding, list)
-        assert len(embedding) == 1024
+        assert len(embedding) == 384
     
     @pytest.mark.unit
     def test_generate_embedding_returns_confidence_score(self, generator, sample_image_bytes):
@@ -93,7 +93,7 @@ class TestEmbeddingGenerator:
         results = generator.generate_embeddings_batch(sample_image_bytes_list)
         for embedding, confidence in results:
             assert isinstance(embedding, list)
-            assert len(embedding) == 1024
+            assert len(embedding) == 384
             assert isinstance(confidence, float)
             assert confidence > 0
     

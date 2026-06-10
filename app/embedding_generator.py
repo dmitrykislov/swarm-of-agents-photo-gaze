@@ -1,159 +1,168 @@
-"""DINOv2 ViT-S/14 embedding generator for image feature extraction with M1 optimization."""
-import torch
-import torch.nn.functional as F
-from typing import List, Tuple, Dict, Optional
-from PIL import Image
-import io
+"""DINOv2 ViT-S/14 embedding generator (384-dim).
 
-# Register HEIF/HEIC decoder so Image.open handles .heic files
+Two interchangeable backends with an identical public API:
+  - "onnx"  — ONNX Runtime + a pre-exported dinov2_vits14.onnx. Tiny footprint
+              (no PyTorch), used by the packaged native app. Numerically
+              identical to torch (verified: cosine ~1.0, max|Δ| ~3e-7).
+  - "torch" — torch.hub DINOv2, used by the Docker stack.
+
+Backend selection (EmbeddingGenerator.__init__ / EMBEDDING_BACKEND env):
+  - explicit "onnx"/"torch", or
+  - auto (default): use ONNX if the .onnx model AND onnxruntime are available,
+    otherwise fall back to torch.
+
+torch is imported lazily inside the torch backend so this module (and the
+native app) load without PyTorch installed.
+"""
+import io
+import os
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+from PIL import Image
+
+# Register HEIF/HEIC decoder so Image.open handles .heic files (both backends).
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
     pass
-import numpy as np
-import platform
+
+# ImageNet normalization constants (shared by both backends).
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
+_DEFAULT_ONNX_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "models", "dinov2_vits14.onnx"
+)
 
 
 class EmbeddingGenerator:
-    """Generate 384-dimensional embeddings using the DINOv2 ViT-S/14 model
-    (resized to 224x224 for speed; chosen over the larger ViT-L/14 to keep
-    CPU/MPS inference fast and the vectors ~14x smaller)."""
-    
-    def __init__(self, device: str = None):
-        """Initialize DINOv2 model for embedding generation.
-        
-        Args:
-            device: torch device ('cuda', 'cpu', 'mps', or None for auto-detection)
-        """
-        # Auto-detect device with M1/Metal support
-        if device is None:
-            self.device = self._detect_device()
-        else:
-            self.device = device
-        
-        # Load DINOv2 ViT-S14 model (outputs 384-dim vectors, ~14x smaller than ViT-L14)
-        self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-        self.model = self.model.to(self.device)
-        self.model.eval()  # Set to evaluation mode
+    """Generate 384-dimensional, L2-normalized DINOv2 ViT-S/14 embeddings.
 
-        # Store model metadata
-        self.model_name = 'dinov2_vits14'
+    Images are resized to 224x224 (faster than the 518 default, plenty for
+    similarity). The keeper ranking and all thresholds are backend-agnostic
+    because the two backends produce the same vectors.
+    """
+
+    def __init__(
+        self,
+        device: str = None,
+        backend: Optional[str] = None,
+        onnx_path: Optional[str] = None,
+        session=None,
+    ):
+        self.model_name = "dinov2_vits14"
         self.embedding_dim = 384
-    
-    def _detect_device(self) -> str:
-        """Detect optimal device: MPS (M1/M2) > CUDA > CPU."""
-        # Check for Apple Silicon with Metal Performance Shaders
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            return 'mps'
-        # Fall back to CUDA if available
-        if torch.cuda.is_available():
-            return 'cuda'
-        # Default to CPU
-        return 'cpu'
-    
-    def _preprocess_image(self, image_data: bytes) -> torch.Tensor:
-        """Convert image bytes to normalized tensor for model input.
-        
-        Args:
-            image_data: Raw image bytes
-        
-        Returns:
-            Preprocessed image tensor (1, 3, 518, 518)
-        """
-        # Load image from bytes
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        
-        # Resize to 224x224 (smaller than DINOv2 standard 518, much faster on CPU)
-        image = image.resize((224, 224), Image.Resampling.BICUBIC)
-        
-        # Convert to tensor and normalize
-        image_tensor = torch.from_numpy(np.array(image)).float() / 255.0
-        image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
-        
-        # Normalize with ImageNet statistics
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        image_tensor = (image_tensor - mean) / std
-        
-        return image_tensor.unsqueeze(0).to(self.device)  # Add batch dimension
-    
-    def generate_embedding(self, image_data: bytes) -> Tuple[List[float], float]:
-        """Generate embedding for a single image.
-        
-        Args:
-            image_data: Raw image bytes
-        
-        Returns:
-            Tuple of (embedding vector as list, confidence score)
-        """
-        with torch.no_grad():
-            # Preprocess image
-            image_tensor = self._preprocess_image(image_data)
-            
-            # Generate embedding with device-specific optimizations
-            if self.device == 'mps':
-                # MPS requires explicit casting for stability
-                embedding = self.model(image_tensor.float())
-            else:
-                embedding = self.model(image_tensor)
-            
-            # Calculate confidence as the norm of the embedding before normalization
-            # (higher norm indicates stronger feature activation)
-            confidence = float(torch.norm(embedding, p=2).item())
-            
-            # Normalize embedding to unit length (L2 normalization)
-            embedding = F.normalize(embedding, p=2, dim=1)
-            
-            # Convert to list and return with confidence
-            embedding_list = embedding.squeeze(0).cpu().tolist()
-            return embedding_list, confidence
-    
-    def generate_embeddings_batch(self, image_data_list: List[bytes]) -> List[Tuple[List[float], float]]:
-        """Generate embeddings for multiple images in batch.
-        
-        Args:
-            image_data_list: List of raw image bytes
-        
-        Returns:
-            List of tuples (embedding vector as list, confidence score)
-        """
-        results = []
-        
-        with torch.no_grad():
-            # Process images in batch
-            image_tensors = []
-            for image_data in image_data_list:
-                image_tensor = self._preprocess_image(image_data)
-                image_tensors.append(image_tensor)
-            
-            # Stack all images into single batch tensor
-            batch_tensor = torch.cat(image_tensors, dim=0)
-            
-            # Generate embeddings for entire batch
-            embeddings = self.model(batch_tensor)
-            
-            # Calculate confidence scores (norm before normalization)
-            confidences = torch.norm(embeddings, p=2, dim=1)
-            
-            # Normalize embeddings
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-            
-            # Convert to list format with confidence scores
-            for i in range(len(image_data_list)):
-                embedding_list = embeddings[i].cpu().tolist()
-                confidence = float(confidences[i].item())
-                results.append((embedding_list, confidence))
-        
-        return results
-    
-    async def generate(self, file_path: str) -> List[float]:
-        """Async wrapper: read image from path and return its embedding vector.
+        self._onnx_path = onnx_path or os.getenv("DINOV2_ONNX_PATH", _DEFAULT_ONNX_PATH)
 
-        Used by the job queue worker which calls this per photo via asyncio.
-        The heavy lifting (preprocess + model forward) is pushed to a thread
-        so it does not block the event loop.
-        """
+        backend = backend or os.getenv("EMBEDDING_BACKEND")
+        if session is not None:
+            backend = "onnx"  # injected session (tests) implies ONNX path
+        if backend is None:
+            backend = "onnx" if self._onnx_available() else "torch"
+        self.backend = backend
+
+        if backend == "onnx":
+            self.device = "onnx"
+            if session is not None:
+                self._session = session
+            else:
+                import onnxruntime as ort
+                self._session = ort.InferenceSession(
+                    self._onnx_path, providers=self._onnx_providers()
+                )
+            self._input_name = self._session.get_inputs()[0].name
+        else:
+            import torch
+            self._torch = torch
+            self.device = device or self._detect_device()
+            self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+            self.model = self.model.to(self.device)
+            self.model.eval()
+
+    # ----------------------------- backend setup -----------------------------
+
+    def _onnx_available(self) -> bool:
+        if not os.path.isfile(self._onnx_path):
+            return False
+        try:
+            import onnxruntime  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _onnx_providers() -> List[str]:
+        """CPU by default. Set EMBEDDING_ONNX_COREML=1 to try Apple's CoreML
+        execution provider first (faster on Apple Silicon; CPU stays as the
+        fallback)."""
+        if os.getenv("EMBEDDING_ONNX_COREML") == "1":
+            return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        return ["CPUExecutionProvider"]
+
+    def _detect_device(self) -> str:
+        """Detect optimal torch device: MPS (Apple) > CUDA > CPU."""
+        torch = self._torch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    # ----------------------------- inference ----------------------------------
+
+    def _preprocess(self, image_data: bytes) -> np.ndarray:
+        """Bytes -> (1, 3, 224, 224) float32, ImageNet-normalized. Pure
+        Pillow + numpy (no torch), identical math to the original torch path."""
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image = image.resize((224, 224), Image.Resampling.BICUBIC)
+        arr = np.asarray(image, dtype=np.float32) / 255.0   # HWC
+        arr = arr.transpose(2, 0, 1)                          # CHW
+        arr = (arr - _MEAN) / _STD
+        return arr[np.newaxis, ...].astype(np.float32)        # (1, 3, 224, 224)
+
+    def _embed_raw(self, batch: np.ndarray) -> np.ndarray:
+        """Run the model on a (B, 3, 224, 224) batch → (B, 384) raw (un-
+        normalized) embeddings, as numpy. Backend-specific."""
+        if self.backend == "onnx":
+            out = self._session.run(None, {self._input_name: batch.astype(np.float32)})[0]
+            return np.asarray(out, dtype=np.float32)
+        torch = self._torch
+        with torch.no_grad():
+            t = torch.from_numpy(batch)
+            if self.device != "cpu":
+                t = t.to(self.device)
+            out = self.model(t)
+            return out.detach().cpu().numpy()
+
+    @staticmethod
+    def _normalize(raw: np.ndarray) -> Tuple[List[float], float]:
+        """(384,) raw → (unit-normalized list, confidence). Confidence is the
+        L2 norm before normalization (stronger feature activation = higher)."""
+        confidence = float(np.linalg.norm(raw))
+        emb = raw / (confidence if confidence else 1.0)
+        return emb.astype(np.float32).tolist(), confidence
+
+    def generate_embedding(self, image_data: bytes) -> Tuple[List[float], float]:
+        """Embedding for a single image → (unit vector as list, confidence)."""
+        raw = self._embed_raw(self._preprocess(image_data))[0]
+        return self._normalize(raw)
+
+    def generate_embeddings_batch(
+        self, image_data_list: List[bytes]
+    ) -> List[Tuple[List[float], float]]:
+        """Embeddings for many images in one forward pass."""
+        if not image_data_list:
+            return []
+        batch = np.concatenate([self._preprocess(b) for b in image_data_list], axis=0)
+        raws = self._embed_raw(batch)
+        return [self._normalize(raw) for raw in raws]
+
+    async def generate(self, file_path: str) -> List[float]:
+        """Async wrapper used by the job-queue worker: read the file and return
+        its embedding vector. Heavy work runs in a thread so the event loop is
+        not blocked."""
         import asyncio
 
         def _run() -> List[float]:
@@ -164,15 +173,11 @@ class EmbeddingGenerator:
 
         return await asyncio.to_thread(_run)
 
-    def get_model_info(self) -> Dict[str, any]:
-        """Return metadata about the embedding model.
-        
-        Returns:
-            Dictionary with model name and embedding dimension
-        """
+    def get_model_info(self) -> Dict[str, object]:
+        """Metadata about the embedding model + active backend."""
         return {
-            'model_name': self.model_name,
-            'embedding_dim': self.embedding_dim,
-            'device': self.device
+            "model_name": self.model_name,
+            "embedding_dim": self.embedding_dim,
+            "device": self.device,
+            "backend": self.backend,
         }
-
