@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { deduplicatePhotos, fetchPhotoImageInfo } from '../api';
+import { deduplicatePhotos, fetchPhotoImageInfo, API_BASE_URL } from '../api';
 import './GroupDetailView.css';
 
 interface Photo {
@@ -30,7 +30,7 @@ interface GroupDetailViewProps {
   onDeleted?: (deletedIds: Set<number>) => void;
 }
 
-const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 function formatBytes(bytes?: number): string {
   if (!bytes) return '—';

@@ -88,15 +88,17 @@ def start_qdrant_sidecar(binary: str, storage_dir: str, http_port: int):
     )
 
 
-def configure_environment(base: str, api_port: int) -> None:
+def configure_environment(base: str) -> None:
     """Point the FastAPI app at SQLite, the bundled ONNX model and React build,
-    and set its public URL — all before app.main is imported. setdefault so
-    explicit env (dev/tests) always wins."""
+    all before app.main is imported. setdefault so explicit env (dev/tests)
+    always wins."""
     os.environ.setdefault("DATABASE_URL", f"sqlite:///{os.path.join(base, 'app.db')}")
     os.environ.setdefault("DINOV2_ONNX_PATH", bundled("models", "dinov2_vits14.onnx"))
     os.environ.setdefault("EMBEDDING_BACKEND", "onnx")
     os.environ.setdefault("TRASH_DIR", os.path.join(base, "trash"))
-    os.environ.setdefault("BACKEND_PUBLIC_URL", f"http://127.0.0.1:{api_port}")
+    # Empty → thumbnail links are RELATIVE ("/thumbnails/..."), so the
+    # same-origin UI reaches them on whatever port we end up on.
+    os.environ.setdefault("BACKEND_PUBLIC_URL", "")
     fe = bundled("build")
     if os.path.isdir(fe):
         os.environ.setdefault("FRONTEND_DIR", fe)
@@ -117,7 +119,7 @@ def main() -> None:
             print("WARNING: Qdrant sidecar did not become ready in time", file=sys.stderr)
     os.environ.setdefault("QDRANT_URL", "http://127.0.0.1:6333")
 
-    configure_environment(base, api_port)
+    configure_environment(base)
 
     url = f"http://127.0.0.1:{api_port}"
     threading.Thread(

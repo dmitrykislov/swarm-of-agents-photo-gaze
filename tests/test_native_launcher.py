@@ -62,8 +62,9 @@ def test_configure_environment_sets_sqlite_and_backend(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     base = str(tmp_path / "data")
     os.makedirs(base, exist_ok=True)
-    native.configure_environment(base, 8765)
+    native.configure_environment(base)
     assert os.environ["DATABASE_URL"] == f"sqlite:///{os.path.join(base, 'app.db')}"
     assert os.environ["EMBEDDING_BACKEND"] == "onnx"
-    assert os.environ["BACKEND_PUBLIC_URL"] == "http://127.0.0.1:8765"
+    # Empty → relative thumbnail URLs (same-origin UI, port-independent).
+    assert os.environ["BACKEND_PUBLIC_URL"] == ""
     assert os.environ["DINOV2_ONNX_PATH"].endswith(os.path.join("models", "dinov2_vits14.onnx"))

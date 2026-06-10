@@ -48,8 +48,22 @@ async function apiFetch(url: string, options?: RequestInit): Promise<Response> {
  * Requests are proxied through package.json proxy configuration.
  */
 
-export const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-const WS_BASE_URL = process.env.REACT_APP_WS_URL || 'ws://localhost:8000';
+// Backend base URL, baked at build time (see vite.config.ts):
+//   - explicit URL (Docker build arg) → used as-is
+//   - "" (native same-origin build)   → relative URLs, so the bundled UI talks
+//     to whatever origin/port FastAPI serves it from
+//   - undefined (dev / jest)          → localhost:8000 fallback
+const _apiBase = process.env.REACT_APP_API_URL;
+export const API_BASE_URL = _apiBase == null ? 'http://localhost:8000' : _apiBase;
+
+// WebSocket base: explicit value wins; otherwise (same-origin build) derive it
+// from the page's origin at runtime so it follows the actual port.
+const _wsBase = process.env.REACT_APP_WS_URL;
+const WS_BASE_URL = _wsBase
+  ? _wsBase
+  : (typeof window !== 'undefined'
+      ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
+      : 'ws://localhost:8000');
 
 export interface HealthResponse {
   status: string;

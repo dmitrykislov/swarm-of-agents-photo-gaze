@@ -141,9 +141,13 @@ similarity_group_service = SimilarityGroupService()
 
 
 def run_migrations():
-    """Run Alembic migrations on startup to ensure schema is up-to-date."""
+    """Run Alembic migrations on startup to ensure schema is up-to-date.
+
+    Skipped for SQLite (the native app): the Alembic revision chain targets
+    Postgres, so on SQLite we rely on init_db()/create_all to build the schema
+    (the models are SQLite-safe). This avoids a noisy, always-failing upgrade."""
     database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/app_db")
-    if not database_url:
+    if not database_url or database_url.startswith("sqlite"):
         return
     try:
         alembic_cfg = Config("alembic.ini")
