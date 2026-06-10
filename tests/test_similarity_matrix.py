@@ -422,7 +422,7 @@ class TestBuildSimilarityGroups:
 
     def test_format_bonus_overrides_raw_size(self):
         """JPEG with size 100k beats HEIC with size 110k because of the
-        20% format bonus. Confirms _best_key behavior."""
+        20% format bonus. Confirms _keeper_key behavior."""
         m = [[1.0, 0.99], [0.99, 1.0]]
         meta = {
             1: {"filename": "a.jpg", "file_path": "",

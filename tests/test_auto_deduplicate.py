@@ -158,9 +158,8 @@ class TestPlanner:
 
         m = [[1.0, 1.0], [1.0, 1.0]]
         _install_cache(m, [1, 2], {
-            # alias is "smaller" by recorded size — under old logic
-            # _best_key wouldn't save it; only correct in-keep
-            # classification does.
+            # alias is "smaller" by recorded size, so quality ranking
+            # wouldn't save it; only correct in-keep classification does.
             1: _meta(str(alias),  file_size=10),
             2: _meta(str(other),  file_size=10_000_000),
         })
@@ -337,29 +336,27 @@ class TestPlanner:
             "transitively-connected pure duplicates must all be deleted"
         )
 
-    def test_in_folder_dups_reduce_to_earliest_outsiders_also_deleted(self):
-        """User spec: the SINGLE EARLIEST in-folder photo is the
-        source of truth. Every other duplicate — including in-folder
-        runner-ups AND outsiders — is deleted.
+    def test_in_folder_dups_reduce_to_highest_quality_outsiders_also_deleted(self):
+        """The single HIGHEST-QUALITY in-folder photo is the source of truth.
+        Every other duplicate — in-folder runner-ups AND outsiders — is deleted.
 
-        Three duplicates: 2 inside keep folder + 1 outside. The earlier
-        in-folder photo (uploaded 2024-01) survives; the later
-        in-folder duplicate (uploaded 2024-06) AND the outsider are
-        both deleted."""
+        Three duplicates: 2 inside keep folder + 1 outside. The larger in-folder
+        photo (5 MB) survives even though it was uploaded later; the smaller
+        in-folder copy AND the outsider are both deleted."""
         m = [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
         _install_cache(m, [1, 2, 3], {
-            # in keep folder, EARLIER → survives
+            # in keep folder, smaller/earlier → deleted (lower quality)
             1: _meta("/photos/keep/small.jpg", file_size=1_000_000,
                      uploaded="2024-01-01T08:00:00"),
-            # in keep folder, LATER → deleted even though it's larger
+            # in keep folder, larger → survives (highest quality)
             2: _meta("/photos/keep/big.jpg", file_size=5_000_000,
                      uploaded="2024-06-01T08:00:00"),
             # outside keep folder → always deleted
             3: _meta("/photos/elsewhere/x.jpg", file_size=5_000_000),
         })
         plan = app_main._plan_auto_dedupe(1.0, "/photos/keep")
-        assert plan["kept"] == [1], "earliest in-keep photo wasn't picked"
-        assert sorted(plan["to_delete"]) == [2, 3]
+        assert plan["kept"] == [2], "highest-quality in-keep photo wasn't picked"
+        assert sorted(plan["to_delete"]) == [1, 3]
         assert plan["groups_processed"] == 1
         assert plan["groups_skipped"] == 0
 
@@ -570,18 +567,32 @@ class TestPlanner:
         )
         assert plan["to_delete"] == [2]
 
-    def test_size_and_format_dont_decide_survivor_anymore(self):
-        """Earliest-taken trumps file size and format bonus. A bigger
-        HEIC taken EARLIER wins over a smaller JPEG taken LATER, even
-        though `_best_key` (used elsewhere for cluster representative
-        display) would rank them the other way."""
+    def test_quality_wins_over_earliest_taken(self):
+        """Quality is the DOMINANT signal: a higher-quality copy is kept even
+        when a lower-quality copy was taken/uploaded earlier. The JPEG (1.0 MB
+        + 20% format bonus = 1.2 MB effective) beats the earlier 1.1 MB HEIC.
+        Mirrors the group view's '★ Best' so manual and auto agree."""
         m = [[1.0, 1.0], [1.0, 1.0]]
         _install_cache(m, [1, 2], {
             1: _meta("/photos/keep/a.jpg",  file_size=1_000_000,
                      mime="image/jpeg",
-                     uploaded="2024-06-01T00:00:00"),  # later
+                     uploaded="2024-06-01T00:00:00"),  # later, but higher quality
             2: _meta("/photos/keep/b.heic", file_size=1_100_000,
                      mime="image/heic",
+                     uploaded="2024-01-01T00:00:00"),  # earlier, but lower quality
+        })
+        plan = app_main._plan_auto_dedupe(1.0, "/photos/keep")
+        assert plan["kept"] == [1]
+        assert plan["to_delete"] == [2]
+
+    def test_earliest_taken_breaks_quality_ties(self):
+        """When quality is equal (byte-identical copies → same effective
+        size), the earliest-taken copy is kept as the likely original."""
+        m = [[1.0, 1.0], [1.0, 1.0]]
+        _install_cache(m, [1, 2], {
+            1: _meta("/photos/keep/a.jpg", file_size=1_000_000,
+                     uploaded="2024-06-01T00:00:00"),  # later
+            2: _meta("/photos/keep/b.jpg", file_size=1_000_000,
                      uploaded="2024-01-01T00:00:00"),  # earlier → survives
         })
         plan = app_main._plan_auto_dedupe(1.0, "/photos/keep")
@@ -593,9 +604,11 @@ class TestPlanner:
 
 
 class TestEarliestInFolderIsSourceOfTruth:
-    """User-explicit spec: when pure duplicates are inside the chosen
-    keep folder, the EARLIEST one (created/taken first) is the source
-    of truth. The rest are deleted. Resolution chain for "earliest":
+    """When duplicates inside the keep folder are EQUAL QUALITY (same
+    effective size — the common byte-identical case used in these tests),
+    the EARLIEST one (taken/created first) is kept as the source of truth;
+    the rest are deleted. Earliest is the TIEBREAKER under the quality-first
+    policy (see _keeper_key). Resolution chain for "earliest":
         EXIF DateTimeOriginal → file mtime → uploaded_at → +inf.
     Tests below exercise each rung of that chain plus the deterministic
     tiebreakers when timestamps tie exactly.

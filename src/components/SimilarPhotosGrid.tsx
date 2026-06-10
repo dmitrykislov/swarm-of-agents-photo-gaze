@@ -29,12 +29,21 @@ interface SimilarPhotosGridProps {
 
 const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold = 0.5, refreshSignal = 0 }) => {
   const [detailGroup, setDetailGroup] = useState<SimilarPhotosGroup | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [page, setPage] = useState(0);
 
-  const { groups, total, loading, error, setGroups } = useSimilaritySearch(
-    jobId, threshold, page, PAGE_SIZE, 300, refreshKey + refreshSignal,
+  const { groups, total, loading, error, setGroups, setTotal } = useSimilaritySearch(
+    jobId, threshold, page, PAGE_SIZE, 300, refreshSignal,
   );
+
+  // Neutral placeholder for thumbnails that fail to load (e.g. a file moved
+  // out from under the index) — avoids the browser's broken-image icon.
+  const onImgError = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    img.onerror = null;
+    img.classList.remove('loading');
+    img.classList.add('thumb-broken');
+    img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  };
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -47,8 +56,12 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
     if (page > totalPages - 1) setPage(totalPages - 1);
   }, [page, totalPages]);
 
-  /** After photos are deleted from a group, update local state instead of full reload */
+  /** After photos are deleted from a group, update local state instead of a
+   * full reload. A group that drops to <2 photos is removed entirely; we
+   * decrement `total` so the header count and page count stay in sync (the
+   * server dropped the same group, so this matches a refetch). */
   const handleDeletedFromGroup = useCallback((groupId: string, deletedIds: Set<number>) => {
+    let dropped = 0;
     setGroups(prev => {
       const updated: SimilarPhotosGroup[] = [];
       for (const g of prev) {
@@ -56,12 +69,9 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
           updated.push(g);
           continue;
         }
-        // Filter out deleted photos from both reference and similar
         const allPhotos = [g.reference_photo, ...g.similar_photos]
           .filter(p => !deletedIds.has(p.photo_id));
-        // If 0 or 1 photos remain, remove the entire group row
-        if (allPhotos.length <= 1) continue;
-        // Rebuild group: first photo becomes reference, rest become similar
+        if (allPhotos.length <= 1) { dropped += 1; continue; }
         updated.push({
           ...g,
           reference_photo: allPhotos[0],
@@ -70,21 +80,15 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
       }
       return updated;
     });
+    if (dropped > 0) setTotal((t) => Math.max(0, t - dropped));
     setDetailGroup(null);
-  }, [setGroups]);
+  }, [setGroups, setTotal]);
 
   const getQualityLabel = (score: number): string => {
     if (score >= 0.85) return 'Excellent';
     if (score >= 0.7) return 'Good';
     if (score >= 0.5) return 'Fair';
     return 'Poor';
-  };
-
-  const getQualityClass = (score: number): string => {
-    if (score >= 0.85) return 'quality-excellent';
-    if (score >= 0.7) return 'quality-good';
-    if (score >= 0.5) return 'quality-fair';
-    return 'quality-poor';
   };
 
   // NOTE: similarity groups are GLOBAL — they come from the whole embedding
@@ -162,6 +166,7 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
                 alt={group.reference_photo.filename}
                 className="thumbnail loading"
                 onLoad={(e) => e.currentTarget.classList.remove('loading')}
+                onError={onImgError}
               />
               <div className="photo-info">
                 <div className="photo-filename">{group.reference_photo.filename}</div>
@@ -179,6 +184,7 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
                   alt={photo.filename}
                   className="thumbnail loading"
                   onLoad={(e) => e.currentTarget.classList.remove('loading')}
+                  onError={onImgError}
                 />
                 <div className="photo-info">
                   <div className="photo-filename">{photo.filename}</div>

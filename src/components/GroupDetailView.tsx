@@ -301,6 +301,11 @@ const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose, onDel
                     alt={photo.filename}
                     className="detail-image"
                     onClick={() => setLightboxPhotoId(photo.photo_id)}
+                    onError={(e) => {
+                      const img = e.currentTarget;
+                      img.onerror = null;
+                      img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+                    }}
                     title="Click for full resolution"
                     style={{ cursor: 'zoom-in' }}
                   />

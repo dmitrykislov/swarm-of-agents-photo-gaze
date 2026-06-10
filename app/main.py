@@ -346,24 +346,53 @@ BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000").rs
 _PREFERRED_MIME_TYPES = {"image/jpeg", "image/png"}
 
 
-def _best_key(m: dict):
-    """Sort key for picking the best (highest-quality, most-likely-original)
-    photo in a duplicate group. Higher key = better.
+def _taken_timestamp(meta: dict) -> float:
+    """Best estimate of when a photo was TAKEN — the provenance tiebreaker
+    among equal-quality duplicates. Resolution order:
+        EXIF DateTimeOriginal → file mtime (both via _read_image_info)
+        → Photo.uploaded_at → +inf.
+    Reads the file only when it still exists on disk; _read_image_info LRU-
+    caches the parse, so repeated ranking of the same photo is cheap."""
+    fpath = meta.get("file_path") or ""
+    if fpath and os.path.isfile(fpath):
+        try:
+            _, _, created_iso = _read_image_info(fpath)
+        except Exception:
+            created_iso = None
+        if created_iso:
+            try:
+                return datetime.fromisoformat(created_iso).timestamp()
+            except Exception:
+                pass
+    uploaded = meta.get("uploaded_at")
+    if uploaded:
+        try:
+            return datetime.fromisoformat(uploaded).timestamp()
+        except Exception:
+            pass
+    return float("inf")
 
-    Primary signal: file size + 20% bonus for preferred (universal) formats.
-    Tiebreakers: earlier upload (likely the original), then shorter filename
-    ("photo.jpg" beats "photo (1).jpg").
+
+def _keeper_key(meta: dict):
+    """Unified ranking for the photo to KEEP in a duplicate set. Used by BOTH
+    the group view ("★ Best") and auto-dedupe, so they always agree on which
+    copy survives. The keeper sorts FIRST under an ascending sort. Preference:
+
+      1. Highest quality — largest effective file size (+20% bonus for the
+         universal JPEG/PNG formats). Less compression = more detail; this
+         is the dominant signal so we never keep a worse copy over a better.
+      2. Earliest-taken — among equal-quality (typically byte-identical)
+         copies, the one taken first is most likely the original. See
+         _taken_timestamp.
+      3. Shortest filename — "photo.jpg" beats "photo (1).jpg".
+      4. Lexically-smallest path — final determinism.
     """
-    size = m.get("file_size") or 0
-    fmt_bonus = int(size * 0.2) if m.get("mime_type") in _PREFERRED_MIME_TYPES else 0
-    score = size + fmt_bonus
-    try:
-        ts_val = (datetime.fromisoformat(m["uploaded_at"]).timestamp()
-                  if m.get("uploaded_at") else 9e12)
-    except Exception:
-        ts_val = 9e12
-    name_len = len(m.get("filename") or "")
-    return (score, -ts_val, -name_len)
+    return (
+        -_effective_size(meta),
+        _taken_timestamp(meta),
+        len(meta.get("filename") or ""),
+        meta.get("file_path") or "",
+    )
 
 
 def _read_manifest(path: str):
@@ -905,47 +934,6 @@ async def deduplicate_photos(request: Request):
         session.close()
 
 
-def _earliest_key(meta: dict):
-    """Sort key for picking the EARLIEST-taken photo as the source of
-    truth in a duplicate cluster. Lower sorts first. Tiebroken so the
-    result is fully deterministic.
-
-    Resolution order for the timestamp:
-      1. EXIF DateTimeOriginal (or the closely-related DateTime tag),
-         read via _read_image_info from the file. Falls back to the
-         file's mtime if EXIF is missing — this is what most users
-         mean by "when this photo was taken/created".
-      2. Photo.uploaded_at — when the file was indexed into the system,
-         which is the only signal we still have if the file is now
-         gone from disk.
-      3. +inf — no information at all; sorts last so any other photo
-         in the cluster wins.
-    Tiebreakers (when timestamps tie exactly): shorter filename first
-    (so "x.jpg" beats "x copy.jpg") then lexically-smaller file_path.
-    """
-    fpath = meta.get("file_path") or ""
-    ts = float("inf")
-    if fpath and os.path.isfile(fpath):
-        try:
-            _, _, created_iso = _read_image_info(fpath)
-        except Exception:
-            created_iso = None
-        if created_iso:
-            try:
-                ts = datetime.fromisoformat(created_iso).timestamp()
-            except Exception:
-                pass
-    if ts == float("inf"):
-        uploaded = meta.get("uploaded_at")
-        if uploaded:
-            try:
-                ts = datetime.fromisoformat(uploaded).timestamp()
-            except Exception:
-                pass
-    name_len = len(meta.get("filename") or "")
-    return (ts, name_len, fpath)
-
-
 def _is_under(child: str, parent_abs: str) -> bool:
     """True iff `child` (taken AS-IS, only abspath-normalized) equals
     `parent_abs` or is strictly inside it. parent_abs must already be a
@@ -977,13 +965,14 @@ def _plan_auto_dedupe(threshold: float, keep_folder: str) -> dict:
     For each cluster of pure duplicates (connected component above
     `threshold`):
 
-      - If at least one member's file lives under keep_folder, pick
-        the SINGLE EARLIEST-taken member (EXIF DateTimeOriginal, then
-        mtime, then uploaded_at) as the survivor. Every other member
-        of the cluster is deleted, INCLUDING any other in-folder
-        duplicates — duplicates within the keep folder are still
+      - If at least one member's file lives under keep_folder, pick the
+        single SURVIVOR among the in-keep members by _keeper_key —
+        highest quality (largest effective size), with earliest-taken
+        (EXIF DateTimeOriginal → mtime → uploaded_at) as the tiebreaker.
+        Every other member of the cluster is deleted, INCLUDING any other
+        in-folder duplicates — duplicates within the keep folder are still
         duplicates, and only one canonical copy needs to survive.
-        See _earliest_key for the full ranking and tiebreakers.
+        See _keeper_key for the full ranking and tiebreakers.
       - If no member is under keep_folder → skip the whole cluster
         (we never make a destructive choice without an explicit
         anchor in the user's chosen folder).
@@ -1061,11 +1050,13 @@ def _plan_auto_dedupe(threshold: float, keep_folder: str) -> dict:
             # Counted so the UI can report "X groups skipped".
             skipped += 1
             continue
-        # Pick the SINGLE EARLIEST-taken in-keep member as the survivor.
+        # Pick the survivor among the in-keep members: highest quality, with
+        # earliest-taken as the tiebreaker (see _keeper_key). Same ranking the
+        # group view uses, so manual and auto agree on which copy is kept.
         in_comp_with_keys = sorted(
             [
                 (
-                    _earliest_key(photo_meta.get(photo_ids[k]) or {}),
+                    _keeper_key(photo_meta.get(photo_ids[k]) or {}),
                     k,
                     photo_ids[k],
                     photo_meta.get(photo_ids[k]) or {},
@@ -1486,8 +1477,13 @@ async def get_thumbnail(photo_id: int, size: int = 200):
         if not os.path.isfile(photo.file_path):
             return JSONResponse(status_code=404, content={"error": "Photo file not found on disk"})
 
+        # The thumbnail cache is keyed by file_hash. file_hash is nullable
+        # (hashing can fail), and a None key would make every hash-less photo
+        # collide onto one cache file (wrong thumbnails). Fall back to a
+        # per-photo key so each still gets its own thumbnail.
+        cache_key = photo.file_hash or f"photo-{photo.id}"
         thumb_path = thumbnail_service.get_thumbnail(
-            photo.file_path, photo.file_hash, size=(size, size)
+            photo.file_path, cache_key, size=(size, size)
         )
         return FileResponse(thumb_path, media_type="image/jpeg")
     except Exception as e:
@@ -1897,7 +1893,7 @@ _PURE_DUPE_EPSILON = 1e-4  # float32 normalize-then-dot noise floor
 
 def _effective_size(meta: dict) -> float:
     """File size with the same +20% bonus for universally-decodable formats
-    (JPEG/PNG) that _best_key uses. Keeps the quality score monotonic with
+    (JPEG/PNG) that _keeper_key uses. Keeps the quality score monotonic with
     the keeper ranking, so the photo we mark "Best" is also the highest
     quality in its group."""
     size = float(meta.get("file_size") or 0)
@@ -2314,7 +2310,10 @@ def _build_similarity_groups_from_qdrant(threshold: float):
         if len(members) < 2:
             continue
 
-        members.sort(key=_best_key, reverse=True)
+        # Keeper ("★ Best") = quality-first, earliest-taken tiebreak — the
+        # same ranking auto-dedupe uses (see _keeper_key). Ascending sort,
+        # best first.
+        members.sort(key=_keeper_key)
         ref = members[0]
         others = members[1:]
         ref_pid = ref["photo_id"]

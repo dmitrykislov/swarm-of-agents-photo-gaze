@@ -12,6 +12,9 @@ export interface UseSimilaritySearchResult {
   loading: boolean;
   error: string | null;
   setGroups: React.Dispatch<React.SetStateAction<SimilarPhotosGroup[]>>;
+  /** Lets the grid keep the total/page count in sync when it removes a group
+   * locally (after a deletion) without a full refetch. */
+  setTotal: React.Dispatch<React.SetStateAction<number>>;
 }
 
 export function useSimilaritySearch(
@@ -68,5 +71,5 @@ export function useSimilaritySearch(
     };
   }, [jobId, threshold, page, pageSize, debounceMs, refreshKey]);
 
-  return { groups, total, loading, error, setGroups };
+  return { groups, total, loading, error, setGroups, setTotal };
 }
