@@ -1,28 +1,90 @@
-/* CSS Variables for theme system */
+/* Design tokens — colors, surfaces, radius, shadows, spacing.
+   Light is the default; dark overrides the same variables. Legacy names
+   (--bg-primary, --accent-color, …) are kept as aliases so existing
+   component stylesheets keep working. */
 
 :root[data-theme='light'],
 :root:not([data-theme]) {
-  --bg-primary: #ffffff;
-  --bg-secondary: #f5f5f5;
-  --bg-tertiary: #eeeeee;
-  --text-primary: #000000;
-  --text-secondary: #666666;
-  --border-color: #cccccc;
-  --accent-color: #0066cc;
+  --bg-app: #f4f6f9;
+  --surface: #ffffff;
+  --surface-2: #f3f5f8;
+  --surface-hover: #eef1f6;
+
+  --text-primary: #131720;
+  --text-secondary: #545d6b;
+  --text-muted: #8b94a3;
+
+  --border: #e4e8ee;
+  --border-strong: #d4dae2;
+
+  --brand: #2f6df6;
+  --brand-hover: #1e57db;
+  --brand-soft: #eaf1ff;
+
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --danger-soft: #fdecec;
+  --success: #15a14a;
+  --success-soft: #e7f6ed;
+  --warning: #d97706;
+  --warning-soft: #fdf0dd;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .07);
+  --shadow-md: 0 6px 18px rgba(16, 24, 40, .08);
+  --ring: 0 0 0 3px rgba(47, 109, 246, .25);
+
+  /* legacy aliases */
+  --bg-primary: var(--surface);
+  --bg-secondary: var(--surface-2);
+  --bg-tertiary: var(--surface-hover);
+  --border-color: var(--border);
+  --accent-color: var(--brand);
 }
 
 :root[data-theme='dark'] {
-  --bg-primary: #1a1a1a;
-  --bg-secondary: #2d2d2d;
-  --bg-tertiary: #3d3d3d;
-  --text-primary: #ffffff;
-  --text-secondary: #b0b0b0;
-  --border-color: #444444;
-  --accent-color: #4da6ff;
+  --bg-app: #0f1319;
+  --surface: #171c24;
+  --surface-2: #1f2630;
+  --surface-hover: #232b37;
+
+  --text-primary: #eef2f7;
+  --text-secondary: #aab4c2;
+  --text-muted: #788294;
+
+  --border: #2a323d;
+  --border-strong: #38424f;
+
+  --brand: #5b8cff;
+  --brand-hover: #7aa2ff;
+  --brand-soft: #1a2740;
+
+  --danger: #f06363;
+  --danger-hover: #f47d7d;
+  --danger-soft: #3a1f22;
+  --success: #4ade80;
+  --success-soft: #16301f;
+  --warning: #f0a850;
+  --warning-soft: #33260f;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, .4);
+  --ring: 0 0 0 3px rgba(91, 140, 255, .35);
+
+  --bg-primary: var(--surface);
+  --bg-secondary: var(--surface-2);
+  --bg-tertiary: var(--surface-hover);
+  --border-color: var(--border);
+  --accent-color: var(--brand);
 }
 
 body {
-  background-color: var(--bg-primary);
+  background-color: var(--bg-app);
   color: var(--text-primary);
-  transition: background-color 0.3s ease, color 0.3s ease;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }

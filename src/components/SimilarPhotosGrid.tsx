@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useSimilaritySearch } from '../hooks/useSimilaritySearch';
 import GroupDetailView from './GroupDetailView';
 import './SimilarPhotosGrid.css';
@@ -18,16 +18,34 @@ export interface SimilarPhotosGroup {
   best_reasons?: string[];
 }
 
+const PAGE_SIZE = 20;
+
 interface SimilarPhotosGridProps {
   jobId: string;
   threshold?: number;
+  /** Bumped by the parent to force a refresh (e.g. after a folder is removed). */
+  refreshSignal?: number;
 }
 
-const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold = 0.5 }) => {
+const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold = 0.5, refreshSignal = 0 }) => {
   const [detailGroup, setDetailGroup] = useState<SimilarPhotosGroup | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [page, setPage] = useState(0);
 
-  const { groups, loading, error, setGroups } = useSimilaritySearch(jobId, threshold, 300, refreshKey);
+  const { groups, total, loading, error, setGroups } = useSimilaritySearch(
+    jobId, threshold, page, PAGE_SIZE, 300, refreshKey + refreshSignal,
+  );
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  // Reset to the first page whenever the threshold or an external refresh
+  // changes the result set, so we never sit on an out-of-range page.
+  useEffect(() => { setPage(0); }, [threshold, refreshSignal]);
+
+  // Clamp if the last page shrank (e.g. deletions reduced the total).
+  useEffect(() => {
+    if (page > totalPages - 1) setPage(totalPages - 1);
+  }, [page, totalPages]);
 
   /** After photos are deleted from a group, update local state instead of full reload */
   const handleDeletedFromGroup = useCallback((groupId: string, deletedIds: Set<number>) => {
@@ -74,14 +92,6 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
   // (which is empty after a page reload); duplicates stay visible whenever the
   // index has them. The empty-state below covers "index has no groups yet".
 
-  if (loading) {
-    return (
-      <div className="similar-photos-container">
-        <p>Loading similar photos...</p>
-      </div>
-    );
-  }
-
   if (error) {
     return (
       <div className="similar-photos-container">
@@ -90,13 +100,28 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
     );
   }
 
+  // First load (no data yet): show the loader. On page changes we keep the
+  // previous page visible (groups stays populated) so the view doesn't flash.
   if (groups.length === 0) {
     return (
       <div className="similar-photos-container">
-        <p>No similar photos found.</p>
+        <p className="muted">{loading ? 'Loading similar photos…' : 'No similar photos found.'}</p>
       </div>
     );
   }
+
+  const pager = totalPages > 1 ? (
+    <div className="pager">
+      <button className="btn btn--sm" disabled={page === 0} onClick={() => setPage(0)}>« First</button>
+      <button className="btn btn--sm" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>‹ Prev</button>
+      <span className="pager__info">Page {page + 1} of {totalPages}</span>
+      <button className="btn btn--sm" disabled={page >= totalPages - 1} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}>Next ›</button>
+      <button className="btn btn--sm" disabled={page >= totalPages - 1} onClick={() => setPage(totalPages - 1)}>Last »</button>
+    </div>
+  ) : null;
+
+  const rangeStart = page * PAGE_SIZE + 1;
+  const rangeEnd = page * PAGE_SIZE + groups.length;
 
   return (
     <div className="similar-photos-container">
@@ -109,7 +134,15 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
           }}
         />
       )}
-      <h2 className="grid-title">Similar Photos ({groups.length} groups)</h2>
+      <div className="grid-head">
+        <h2 className="grid-title">
+          Similar groups <span className="grid-count">{total.toLocaleString()}</span>
+          {total > PAGE_SIZE && (
+            <span className="grid-range"> · showing {rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()}</span>
+          )}
+        </h2>
+        {pager}
+      </div>
       {groups.map((group) => (
         <div
           key={group.group_id}
@@ -165,8 +198,10 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
           </div>
         </div>
       ))}
+      {totalPages > 1 && <div className="pager pager--bottom">{pager}</div>}
     </div>
   );
 };
+/* (bottom pager reuses the .pager element; .pager--bottom only adds spacing) */
 
 export default SimilarPhotosGrid;

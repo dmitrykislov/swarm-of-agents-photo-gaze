@@ -53,3 +53,6 @@ htmlcov/
 # Planning/verification artifacts
 .verification-plan.json
 done-tasks.md
+
+# Local, never-committed planning/scratch docs
+.local/

@@ -142,9 +142,16 @@ export async function addFolder(path: string): Promise<FolderEntry> {
   return response.json();
 }
 
-export async function deleteFolder(id: number): Promise<void> {
+export interface DeleteFolderResult {
+  deleted: number;
+  photos_removed: number;
+  embeddings_removed: number;
+}
+
+export async function deleteFolder(id: number): Promise<DeleteFolderResult> {
   const response = await fetch(`${API_BASE_URL}/folders/${id}`, { method: 'DELETE' });
   if (!response.ok) throw new Error(`Failed to delete folder: ${response.statusText}`);
+  return response.json();
 }
 
 export async function scanFolder(id: number): Promise<{ job_id?: string; message: string }> {
@@ -421,6 +428,37 @@ export async function searchSimilarPhotos(jobId: string, threshold: number): Pro
   }
   const data = await response.json();
   return data.groups || [];
+}
+
+export interface SimilarityGroupsPage {
+  groups: any[];
+  total: number;
+  skip: number;
+  limit: number;
+}
+
+/**
+ * Fetch ONE page of similarity groups. `total` is the full count at this
+ * threshold so the UI can paginate all the way to the last page (no cap).
+ */
+export async function fetchSimilarityGroups(
+  threshold: number,
+  skip: number,
+  limit: number,
+): Promise<SimilarityGroupsPage> {
+  const response = await fetch(
+    `${API_BASE_URL}/similarity-groups?min_similarity=${threshold}&skip=${skip}&limit=${limit}`,
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to fetch similar photos: ${response.statusText}`);
+  }
+  const data = await response.json();
+  return {
+    groups: data.groups || [],
+    total: data.total ?? (data.groups?.length || 0),
+    skip: data.skip ?? skip,
+    limit: data.limit ?? limit,
+  };
 }
 
 /**
