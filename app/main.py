@@ -2497,3 +2497,21 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
             await websocket.send_json({"error": str(e)})
         except Exception:
             pass
+
+
+# ─────────────── Serve the built React UI from FastAPI ───────────────
+# Native (no-Docker) app: one process serves the API AND the static UI on the
+# same origin. In Docker the UI is a separate container, so FRONTEND_DIR is
+# unset and this is a no-op. Mounted LAST, so every API route defined above
+# takes precedence; the static mount only catches what's left (/, /assets/…).
+def _mount_frontend(app_, directory: str) -> bool:
+    """Mount `directory` as a static SPA at '/' if it exists. Returns whether
+    it was mounted (so callers/tests can assert)."""
+    if not directory or not os.path.isdir(directory):
+        return False
+    from fastapi.staticfiles import StaticFiles
+    app_.mount("/", StaticFiles(directory=directory, html=True), name="frontend")
+    return True
+
+
+_mount_frontend(app, os.getenv("FRONTEND_DIR", ""))

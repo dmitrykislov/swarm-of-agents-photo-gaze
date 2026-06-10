@@ -32,7 +32,8 @@ class JobQueueManager:
             "DATABASE_URL",
             "postgresql://postgres:postgres@localhost:5432/app_db"
         )
-        self.engine = create_engine(self.database_url)
+        from app.database import make_engine
+        self.engine = make_engine(self.database_url)
         self.SessionLocal = sessionmaker(bind=self.engine)
         self.active_jobs: Dict[str, Dict] = {}  # In-memory tracking of active jobs
         self.embedding_generator = EmbeddingGenerator()
