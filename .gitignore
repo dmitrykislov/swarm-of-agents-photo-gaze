@@ -59,3 +59,7 @@ done-tasks.md
 
 # Exported ONNX model (regenerate via scripts/export_dinov2_onnx.py)
 models/
+
+# Native build inputs/outputs
+vendor/
+dist/
