@@ -1,4 +1,4 @@
-"""DINOv2 ViT-L14 embedding generator for image feature extraction with M1 optimization."""
+"""DINOv2 ViT-S/14 embedding generator for image feature extraction with M1 optimization."""
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
@@ -16,7 +16,9 @@ import platform
 
 
 class EmbeddingGenerator:
-    """Generate 1024-dimensional embeddings using DINOv2 ViT-L14 model."""
+    """Generate 384-dimensional embeddings using the DINOv2 ViT-S/14 model
+    (resized to 224x224 for speed; chosen over the larger ViT-L/14 to keep
+    CPU/MPS inference fast and the vectors ~14x smaller)."""
     
     def __init__(self, device: str = None):
         """Initialize DINOv2 model for embedding generation.

@@ -1,642 +1,159 @@
 # Architecture Overview
 
+A self-hosted photo deduplication system: a React/TypeScript UI talks to a
+FastAPI backend that stores photo metadata in PostgreSQL, 384-dim DINOv2
+embeddings in Qdrant, and finds/serves near-duplicate groups. Everything runs
+locally via Docker Compose.
 
-
-## System Design
-
-
-
-The Photo Similarity Finder is a distributed system with clear separation of concerns:
-
-
+## System diagram
 
 ```
-
-┌─────────────────────────────────────────────────────────────┐
-
-│                     React Frontend (Port 3000)               │
-
-│  ┌──────────────────────────────────────────────────────┐   │
-
-│  │ FolderPathSelector │ ThresholdInput │ SimilarityGrid │   │
-
-│  └──────────────────────────────────────────────────────┘   │
-
-└─────────────────────────────────────────────────────────────┘
-
-                    ↓ HTTP + WebSocket
-
-┌─────────────────────────────────────────────────────────────┐
-
-│                  FastAPI Backend (Port 8000)                │
-
-│  ┌──────────────────────────────────────────────────────┐   │
-
-│  │ REST Endpoints │ WebSocket Handler │ Error Handlers  │   │
-
-│  └──────────────────────────────────────────────────────┘   │
-
-│  ┌──────────────────────────────────────────────────────┐   │
-
-│  │ Orchestrator │ Job Queue │ Similarity Search Service │   │
-
-│  └──────────────────────────────────────────────────────┘   │
-
-│  ┌──────────────────────────────────────────────────────┐   │
-
-│  │ Folder Scanner │ Metadata Extractor │ Thumbnail Gen  │   │
-
-│  └──────────────────────────────────────────────────────┘   │
-
-└─────────────────────────────────────────────────────────────┘
-
-         ↓ SQL              ↓ Vector Ops      ↓ Backup
-
-    ┌─────────────┐    ┌──────────────┐   ┌──────────┐
-
-    │ PostgreSQL  │    │ Qdrant       │   │ S3/Local │
-
-    │ (Metadata)  │    │ (Embeddings) │   │ (Backup) │
-
-    └─────────────┘    └──────────────┘   └──────────┘
-
+┌──────────────────────────────────────────────────────────────┐
+│  React UI (host port REACT_PORT, default 3001)                 │
+│  App.tsx · SimilarPhotosGrid · GroupDetailView ·               │
+│  AutoDeduplicateModal · TrashPage · ProgressBar                │
+└──────────────────────────────────────────────────────────────┘
+                  ↓ HTTP + WebSocket (to FASTAPI_PORT, default 8000)
+┌──────────────────────────────────────────────────────────────┐
+│  FastAPI backend (app/)                                        │
+│  REST + WebSocket · metrics & error middleware                 │
+│  JobQueueManager · FolderScanner · EmbeddingGenerator (DINOv2, │
+│  in-process) · in-memory similarity index · BackupManager      │
+└──────────────────────────────────────────────────────────────┘
+        ↓ SQLAlchemy        ↓ vectors          ↓ /metrics
+  ┌──────────────┐    ┌──────────────┐   ┌──────────────────────┐
+  │ PostgreSQL    │    │ Qdrant       │   │ Prometheus +         │
+  │ (metadata)    │    │ (embeddings) │   │ Alertmanager         │
+  └──────────────┘    └──────────────┘   └──────────────────────┘
 ```
 
-
-
-## Component Architecture
-
-
-
-### Frontend (React + TypeScript)
-
-
-
-**Location**: `frontend/src/`
-
-
-
-#### Key Components
-
-
-1. **App.tsx** - Main application container
-
-   - Manages global state (theme, user preferences)
-
-   - Routes between folder selection and results view
-
-   - Handles WebSocket connection lifecycle
-
-
-
-2. **FolderPathSelector.tsx** - Folder selection UI
-
-   - Text input for folder path
-
-   - Validation feedback
-
-   - Triggers `/rescan` endpoint
-
-
-
-3. **ThresholdInput.tsx** - Similarity threshold control
-
-   - Slider (0-1) for threshold adjustment
-
-   - Real-time preview of expected group count
-
-   - Triggers `/search` endpoint
-
-
-
-4. **SimilarityGrid** - Results display
-
-   - Grid layout of similarity groups
-
-   - Thumbnail previews
-
-   - Group metadata (similarity score, member count)
-
-
-
-#### API Client (api.ts)
-
-
-
-- Centralized HTTP client with error handling
-
-- WebSocket connection manager for progress updates
-
-- Type-safe interfaces for all API responses
-
-- Automatic retry logic for transient failures
-
-
-
-### Backend (FastAPI + Python)
-
-
-
-**Location**: `app/`
-
-
-
-#### Core Modules
-
-
-
-1. **main.py** - Application entry point
-
-   - FastAPI app initialization
-
-   - HTTP endpoint definitions
-
-   - WebSocket handler
-
-   - Middleware for metrics and error handling
-
-   - Startup/shutdown hooks
-
-
-
-2. **folder_scanner.py** - File system traversal
-
-   - Recursive directory scanning
-
-   - Image format filtering (JPEG, PNG, WebP)
-
-   - Returns list of photo paths
-
-
-
-3. **metadata_extractor.py** - Image metadata extraction
-
-   - EXIF data parsing (camera, date, GPS)
-
-   - Image dimensions and format detection
-
-   - SHA256 file hash for deduplication
-
-   - Validates image format before processing
-
-
-
-4. **orchestrator.py** - Workflow orchestration
-
-   - Coordinates folder scanning → metadata extraction → embedding generation
-
-   - Manages job state transitions
-
-   - Handles error recovery and retries
-
-
-
-5. **job_queue.py** - Async job processing
-
-   - Queue-based job management
-
-   - Checkpoint system for fault tolerance
-
-   - Progress tracking and ETA calculation
-
-   - Recovers incomplete jobs on startup
-
-
-
-6. **similarity_search.py** - In-memory group management
-
-   - Thread-safe storage of similarity groups
-
-   - Group CRUD operations
-
-   - Filtering by threshold
-
-
-
-7. **thumbnail.py** - Thumbnail generation
-
-   - Generates 200x200px thumbnails
-
-   - Caches thumbnails on disk
-
-   - Serves thumbnails via HTTP
-
-
-
-8. **backup_manager.py** - Disaster recovery
-
-   - Automated PostgreSQL backups
-
-   - Qdrant vector database snapshots
-
-   - Point-in-time recovery
-
-   - Retention policy enforcement
-
-
-
-9. **models.py** - SQLAlchemy ORM models
-
-   - `Photo` - Photo metadata and embeddings
-
-   - `User` - User preferences and settings
-
-   - Relationships and constraints
-
-
-
-### Data Flow
-
-
-
-#### Photo Processing Pipeline
-
-
+All host ports are configurable at the top of `start.sh` (or via the same env
+vars in `docker-compose.yml`). Containers talk to each other over the Docker
+network on fixed internal ports (`postgres:5432`, `qdrant:6333`,
+`fastapi:8000`), so changing a host port never breaks inter-service wiring.
+
+## Backend modules (`app/`)
+
+- **main.py** — FastAPI app, all HTTP/WebSocket endpoints, Prometheus + error
+  middleware, startup hooks, and the in-memory similarity index (see below).
+- **folder_scanner.py** — recursive scan with incremental change detection
+  (new/modified via SHA-256 hash, deleted scoped to the scanned folder).
+  Excludes the trash dir and system/VCS dirs.
+- **metadata_extractor.py** — Pillow-based format validation, dimensions, and
+  SHA-256 file hash (HEIC/HEIF via `pillow-heif`).
+- **embedding_generator.py** — DINOv2 **ViT-S/14**, images resized to
+  **224×224**, output **384-dim** L2-normalized vectors. Device auto-detect:
+  **MPS** (Apple Silicon) → CUDA → CPU. No GPU is required.
+- **job_queue.py** — `JobQueueManager`: async per-photo processing with a
+  concurrency semaphore, per-photo progress persistence, completion detection,
+  and checkpoint recovery on restart.
+- **qdrant_client.py** — thin helper wrapper (the live code mostly uses the
+  `qdrant-client` library directly).
+- **backup_manager.py** — periodic local snapshots of Postgres/Qdrant data.
+- **models.py** — SQLAlchemy models (see schema below).
+- **orchestrator.py** — an alternative scan→queue→complete driver. *Not wired
+  into the running HTTP app* (the live endpoints drive `JobQueueManager`
+  directly); kept for reference/tests.
+
+## Frontend (`src/`)
+
+- **App.tsx** — top-level state, folder panel with an inline server-side
+  browser, processing status + progress WebSocket, threshold slider.
+- **SimilarPhotosGrid.tsx** / **useSimilaritySearch.ts** — fetch and render
+  similarity groups (debounced on the threshold). Groups are global, not tied
+  to a job.
+- **GroupDetailView.tsx** — per-group review modal + full-res lightbox,
+  keep/delete toggles, "Mark as Best".
+- **AutoDeduplicateModal.tsx** — pick a source-of-truth folder, preview a
+  dry-run plan, then execute.
+- **TrashPage.tsx** — list and recover trashed files.
+- **api.ts** — typed API client. The backend base URL is baked at build time
+  from `REACT_APP_API_URL` (a docker build arg derived from `FASTAPI_PORT`).
+
+## Data flow
 
 ```
-1. User selects folder via FolderPathSelector
-   ↓
-2. Frontend calls POST /rescan with folder_path
-   ↓
-3. Backend creates job, returns job_id (202 Accepted)
-   ↓
-4. Frontend connects to WebSocket /ws/progress/{job_id}
-   ↓
-5. Backend Orchestrator starts processing:
-   a. FolderScanner finds all image files
-   b. For each image:
-      - MetadataExtractor reads EXIF, dimensions, hash
-      - Store metadata in PostgreSQL
-      - Generate DINOv2 embedding (GPU-accelerated)
-      - Store embedding in Qdrant
-      - Generate thumbnail
-   c. Update job progress via WebSocket
-   ↓
-6. When complete, backend computes similarity groups:
-   - Query Qdrant for similar embeddings
-   - Group by similarity score
-   - Store groups in SimilarityGroupService
-   ↓
-7. Frontend receives completion message
-   ↓
-8. User adjusts threshold via ThresholdInput
-   ↓
-9. Frontend calls POST /search with threshold
-   ↓
-10. Backend filters groups by threshold
-    ↓
-11. Frontend displays SimilarityGrid with results
+1. Add a folder (POST /folders) and scan it (POST /folders/{id}/scan → /rescan).
+   FolderScanner inserts photos + processing_state(pending) rows.
+2. Each photo is processed by JobQueueManager.process_photo:
+   - DINOv2 embedding (384-dim) → upserted to Qdrant
+   - pointer row written to the `embeddings` table; processing_state → completed
+   - progress streamed over /ws/progress/{job_id}
+3. notify_embeddings_changed(photo_id) debounces an index update; the new
+   photos are folded into the in-memory similarity index incrementally.
+4. GET /similarity-groups clusters the index at the requested threshold and
+   returns groups (reference "best" photo + similar photos + reasons).
+5. Deduplicate (manual /deduplicate or sweep /auto-deduplicate): losing
+   copies move to the trash dir with a recovery manifest; their Photo /
+   Embedding / ProcessingState rows and Qdrant points are removed; the index
+   is updated incrementally.
 ```
 
-
-
-#### Similarity Search Algorithm
-
-
-
-1. **Embedding Generation**
-
-   - DINOv2 ViT-B/14 model (768-dimensional vectors)
-
-   - Processes images at 224x224 resolution
-
-   - GPU-accelerated with CUDA (fallback to CPU)
-
-
-
-2. **Vector Storage**
-
-   - Qdrant vector database
-
-   - Cosine similarity metric
-
-   - Indexed for fast nearest-neighbor search
-
-
-
-3. **Grouping**
-
-   - For each photo, find k-nearest neighbors
-
-   - Group by similarity threshold (0-1)
-
-   - Compute group quality score (average similarity)
-
-
-
-4. **Threshold Adjustment**
-
-   - User adjusts threshold slider
-
-   - Groups are filtered in-memory (no re-computation)
-
-   - Results update instantly
-
-
-
-### Database Schema
-
-
-
-#### PostgreSQL Tables
-
-
-
-```sql
-
--- Photos and metadata
-
-CREATE TABLE photos (
-
-  id SERIAL PRIMARY KEY,
-
-  file_path VARCHAR UNIQUE NOT NULL,
-
-  file_hash VARCHAR(64) UNIQUE NOT NULL,
-
-  filename VARCHAR NOT NULL,
-
-  width INTEGER,
-
-  height INTEGER,
-
-  format VARCHAR(10),
-
-  file_size BIGINT,
-
-  created_at TIMESTAMP DEFAULT NOW(),
-
-  updated_at TIMESTAMP DEFAULT NOW()
-
-);
-
-
-
--- User preferences
-
-CREATE TABLE users (
-
-  id SERIAL PRIMARY KEY,
-
-  username VARCHAR UNIQUE NOT NULL,
-
-  email VARCHAR,
-
-  preferred_embedding_model VARCHAR DEFAULT 'dinov2_vitb14',
-
-  enable_auto_processing BOOLEAN DEFAULT true,
-
-  threshold_setting FLOAT DEFAULT 0.75,
-
-  created_at TIMESTAMP DEFAULT NOW(),
-
-  updated_at TIMESTAMP DEFAULT NOW()
-
-);
-
-
-
--- Job tracking
-
-CREATE TABLE jobs (
-
-  id VARCHAR PRIMARY KEY,
-
-  status VARCHAR(20),
-
-  folder_path VARCHAR,
-
-  total_photos INTEGER,
-
-  processed_photos INTEGER,
-
-  checkpoint_data JSONB,
-
-  created_at TIMESTAMP DEFAULT NOW(),
-
-  updated_at TIMESTAMP DEFAULT NOW()
-
-);
-
-```
-
-
-
-#### Qdrant Collections
-
-
-
-```json
-
-{
-
-  "name": "photo_embeddings",
-
-  "vectors": {
-
-    "size": 768,
-
-    "distance": "Cosine"
-
-  },
-
-  "payload_schema": {
-
-    "photo_id": "integer",
-
-    "file_hash": "keyword",
-
-    "filename": "text"
-
-  }
-
-}
-
-```
-
-
-
-### Fault Tolerance
-
-
-
-#### Job Queue Checkpointing
-
-
-
-- After processing each photo, job state is saved to PostgreSQL
-
-- On startup, incomplete jobs are recovered from checkpoint
-
-- Prevents re-processing of already-completed photos
-
-- Supports pause/resume workflows
-
-
-
-#### Backup & Recovery
-
-
-
-- Automated daily backups of PostgreSQL and Qdrant
-
-- Point-in-time recovery available
-
-- Backup retention policy (default: 7 days)
-
-- Manual backup trigger via `/backup/manual` endpoint
-
-
-
-#### Error Handling
-
-
-
-- Global exception handler returns structured JSON errors
-
-- Transient failures (network, timeouts) trigger automatic retries
-
-- Failed photos are logged and skipped (job continues)
-
-- User receives summary of failed photos at job completion
-
-
-
-### Performance Characteristics
-
-
-
-| Operation | Throughput | Latency | Notes |
-
-|-----------|-----------|---------|-------|
-
-| Folder Scan | ~1000 photos/sec | - | Depends on filesystem |
-
-| Metadata Extract | ~50 photos/sec | 20ms/photo | EXIF parsing |
-
-| Embedding Gen | ~10 photos/sec | 100ms/photo | GPU-accelerated |
-
-| Similarity Search | - | <100ms | For 10k photos |
-
-| Threshold Filter | - | <10ms | In-memory operation |
-
-
-
-### Monitoring & Observability
-
-
-
-#### Prometheus Metrics
-
-
-
-- `fastapi_requests_total` - Request count by endpoint and status
-
-- `fastapi_request_duration_seconds` - Request latency histogram
-
-- `fastapi_active_requests` - Current active request gauge
-
-- `fastapi_errors_total` - Error count by type
-
-
-
-#### Logging
-
-
-
-- Structured JSON logging with context (job_id, photo_id)
-
-- Log levels: DEBUG, INFO, WARNING, ERROR
-
-- Logs include stack traces for exceptions
-
-
-
-#### Health Checks
-
-
-
-- `/health` endpoint checks database and Qdrant connectivity
-
-- Returns 503 if any dependency is unavailable
-
-- Used by Docker health checks and load balancers
-
-
-
-### Deployment Architecture
-
-
-
-#### Docker Compose (Development)
-
-
-
-```yaml
-
-services:
-
-  postgres:      # PostgreSQL 14
-
-  qdrant:        # Qdrant vector DB
-
-  backend:       # FastAPI app
-
-  frontend:      # React app
-
-```
-
-
-
-#### Kubernetes (Production)
-
-
-
-- Backend: Deployment with 3+ replicas, HPA based on CPU/memory
-
-- Frontend: Deployment with 2+ replicas, CDN for static assets
-
-- PostgreSQL: StatefulSet with persistent volume, automated backups
-
-- Qdrant: StatefulSet with persistent volume, replication
-
-- Ingress: TLS termination, rate limiting, request routing
-
-
-
-### Security Considerations
-
-
-
-- **Authentication**: Currently none; add JWT/OAuth2 for production
-
-- **Authorization**: Implement role-based access control (RBAC)
-
-- **Input Validation**: All endpoints validate request data
-
-- **SQL Injection**: SQLAlchemy ORM prevents SQL injection
-
-- **CORS**: Configure allowed origins for frontend
-
-- **HTTPS**: Use TLS in production
-
-- **Secrets**: Store database credentials in environment variables
-
-
-
-### Future Enhancements
-
-
-
-1. **Distributed Processing**: Celery for horizontal scaling
-
-2. **Advanced Filtering**: Filter by date, camera, location
-
-3. **Batch Operations**: Delete/move multiple groups at once
-
-4. **Custom Models**: Support for user-trained embedding models
-
-5. **Real-time Collaboration**: Multi-user session support
-
-6. **Mobile App**: Native iOS/Android clients
-
+### Similarity index
+
+Built once at startup and kept in memory:
+
+- **Vectors** — all unit-normalized embeddings (for exact reference-vs-member
+  cosine scoring).
+- **Edge index** — a score-sorted, undirected, de-duplicated set of pairs
+  above `_SIM_CACHE_THRESHOLD` (0.70), stored as three numpy arrays. This is a
+  *sparse* index (not a dense N×N matrix).
+
+Clustering a request at threshold *t* takes a `searchsorted` slice of the edge
+arrays (edges ≥ *t*) plus a BFS over only those edges — **O(active edges)**,
+independent of collection size, so the threshold slider stays responsive at
+hundreds of thousands of photos. Groups are **connected components** (so
+transitive near-duplicates A~B~C stay in one group); the same clustering backs
+both the group view and auto-dedupe.
+
+Index maintenance:
+- **Additions** (after a scan) are folded in incrementally — only the new
+  vectors are searched against Qdrant and their edges merged.
+- **Deletions** (dedupe / folder removal) filter the in-memory index in
+  O(edges); no full Qdrant re-scroll.
+- A full rebuild (`_recompute_sim_cache`) runs at startup, on recovery, and as
+  a fallback.
+
+## Database schema (PostgreSQL)
+
+Tables (see `app/models.py`): `folder_paths`, `photos`, `embeddings`,
+`processing_state`, `user_preferences`, `job_queue`.
+
+- **photos** — `id`, `filename`, `file_path` (unique), `file_size`,
+  `mime_type`, `file_hash` (nullable), `uploaded_at`, `user_id`. Width/height
+  are read on demand from the file (not stored).
+- **embeddings** — pointer rows: `photo_id`, `embedding_model`,
+  `vector_dimension`, `qdrant_point_id`. The actual vector lives in Qdrant.
+- **processing_state** — per-photo pipeline status (`pending`/`completed`/
+  `failed`) + timestamps.
+- **job_queue** — scan/processing jobs: status, totals, checkpoint info.
+
+### Qdrant
+
+Collection **`embeddings`**, **384-dim**, **cosine** distance. Each point's
+payload is `{"photo_id": N}`.
+
+## Cross-cutting concerns
+
+- **Fault tolerance** — `job_queue` checkpoints progress per photo; incomplete
+  jobs are recovered on startup. Per-photo failures are recorded and skipped
+  so a batch still completes.
+- **Deletion safety** — deduplication never deletes a file outright: it moves
+  it to the trash dir with a manifest (full DB + vector snapshot) and only then
+  purges DB/Qdrant. If the file move fails, DB rows are left intact. Recovery
+  restores the file and rebuilds the rows + Qdrant point.
+- **Monitoring** — Prometheus metrics at `/metrics`
+  (`fastapi_requests_total`, `fastapi_request_duration_seconds`,
+  `fastapi_active_requests`, `fastapi_errors_total`); `/health` liveness.
+- **CORS** — any `localhost`/`127.0.0.1` origin (any port) is allowed, so the
+  UI works regardless of `REACT_PORT`; extra origins via `CORS_ORIGINS`.
+- **Security note** — there is no authentication; this is a single-user,
+  self-hosted tool. The server-side `/browse` endpoint can list any directory
+  the backend can read. Add auth and restrict origins before any networked
+  deployment.
+
+## Deployment
+
+Docker Compose services: `postgres` (15-alpine), `qdrant`, `fastapi`, `react`,
+`prometheus`, `alertmanager`, `node-exporter`. Bring everything up with
+`./start.sh`. There is no Kubernetes manifest in this repo.

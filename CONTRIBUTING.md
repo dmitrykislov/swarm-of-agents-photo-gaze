@@ -376,7 +376,7 @@ feat: Add similarity threshold slider
 
 - Add threshold validation (0-1)
 
-- Update /search endpoint to accept threshold parameter
+- Pass the threshold to the /similarity-groups query (min_similarity)
 
 - Add tests for threshold filtering
 

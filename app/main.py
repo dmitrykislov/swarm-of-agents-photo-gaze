@@ -1611,12 +1611,14 @@ def _read_image_info(file_path: str) -> tuple:
 #     of just the removed nodes, so the UI reflects removals right away without
 #     a full Qdrant re-scroll.
 #
-# The cache is a SPARSE ADJACENCY index, NOT a dense N×N cosine matrix.
-# At 60k photos a dense matrix is 14.4 GB; the adjacency stores only
-# pairs above _SIM_CACHE_THRESHOLD (typically 0.7), which on real photo
-# collections is ~20 edges per photo → a few MB. Vectors are kept too
-# (60k × 384 × 4 ≈ 92 MB) so reference-vs-member scoring stays exact
-# even on the rare edge that wasn't above the cache floor.
+# The cache is a SPARSE EDGE index, NOT a dense N×N cosine matrix. At 60k
+# photos a dense matrix is 14.4 GB; we instead keep only pairs above
+# _SIM_CACHE_THRESHOLD (typically 0.7) — on real photo collections ~20 edges
+# per photo. Those are stored as a score-sorted, undirected `edge_arrays`
+# triple of numpy arrays (see _edges_from_adjacency / _threshold_components),
+# which is both compact and O(active-edges) to cluster per request. The unit-
+# normalized vectors are kept too (60k × 384 × 4 ≈ 92 MB) so reference-vs-
+# member scoring stays exact even for an edge that wasn't above the floor.
 
 _sim_cache: Dict[str, object] = {"data": None, "meta": None}
 _sim_debounce_handle: Optional[asyncio.TimerHandle] = None
@@ -2237,8 +2239,9 @@ def _remove_photos_from_cache(deleted_pids: set) -> None:
 
 
 def _build_similarity_groups_from_qdrant(threshold: float):
-    """Cluster photos into groups of similars from the sparse adjacency cache.
-    Reads the precomputed adjacency in O(edges), no Qdrant calls per request.
+    """Cluster photos into similarity groups from the sparse edge index.
+    Reads the precomputed, score-sorted edge arrays in O(active edges) — no
+    Qdrant calls per request — and clusters by connected components.
 
     Threshold handling:
       - threshold > 1.0 returns no groups (no cosine exceeds 1.0 — defends

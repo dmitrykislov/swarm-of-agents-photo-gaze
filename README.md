@@ -46,9 +46,9 @@ A self-hosted photo deduplication tool powered by the DINOv2 vision transformer.
 3. **Generate embeddings** via DINOv2 ViT-S/14 at 224×224. Runs on CPU at ~40 photos/min in Docker, much faster natively on Apple Silicon with MPS.
 4. **Store** metadata in PostgreSQL, 384-dim vectors in Qdrant (cosine similarity).
 5. **Find similar images** with a configurable similarity threshold (default 0.95 for near-exact duplicates).
-6. **Rank duplicates** within each group: largest file wins (less compression = more detail), with a 20% bonus for JPEG/PNG (universally compatible formats). Ties broken by earliest scan date and shortest filename (e.g. `photo.jpg` beats `photo (1).jpg`). Full reasoning shown in the UI.
+6. **Rank duplicates** within each group (manual review): largest file wins (less compression = more detail), with a 20% bonus for JPEG/PNG (universally compatible formats). Ties broken by earliest upload and shortest filename (e.g. `photo.jpg` beats `photo (1).jpg`). This is the photo flagged "★ Best" in the group view, and a quality score (file size normalized across the collection) is shown per photo. Full reasoning shown in the UI.
 7. **Inspect at full resolution** — click any photo for a lightbox with arrow-key navigation, loading spinner, metadata overlay (resolution, file size, type, date created, full path), and keep/delete toggle.
-8. **Deduplicate** — selected files are moved to `~/.photo-gaze-trash/` with a manifest for recovery. Database records and Qdrant vectors are cleaned up. Original "best" photo stays on disk.
+8. **Deduplicate** two ways: **manually** (open a group, mark photos, Delete) or **auto-deduplicate** — pick a "source of truth" folder and sweep every pure-duplicate cluster, keeping the single **earliest-taken** copy inside that folder and trashing the rest. Either way, removed files move to `~/.photo-gaze-trash/` (configurable via `TRASH_DIR`) with a manifest for recovery; their DB records and Qdrant vectors are cleaned up and the kept copy stays on disk.
 
 ## Quick start
 
@@ -59,7 +59,7 @@ A self-hosted photo deduplication tool powered by the DINOv2 vision transformer.
 ./start.sh --down     # stop and remove containers (volumes are kept)
 ```
 
-Then open **http://localhost:3000** and:
+Then open the UI (default **http://localhost:3001** — `start.sh` prints the exact URLs on startup; ports are configurable at the top of `start.sh`) and:
 
 1. Click **Browse & Add** to navigate to a photo folder on your Mac
 2. Click **Scan** to discover photos and start generating embeddings
@@ -84,7 +84,7 @@ Then open **http://localhost:3000** and:
 | **Trash (deleted duplicates)** | `~/.photo-gaze-trash/` | Moved files with timestamp prefix. `*_manifest.json` records original paths for recovery. |
 | **Photo metadata, folders, processing state** | Postgres (`postgres_data` volume) | Tables: `photos`, `folder_paths`, `processing_state`, `job_queue`, `embeddings` (pointer rows), `user_preferences`. |
 | **Embedding vectors (384-dim floats)** | Qdrant (`qdrant_storage` volume) | Collection `embeddings`, cosine distance. Each vector has `{"photo_id": N}` payload. |
-| **Thumbnails** | Inside the backend container at `/app/thumbnails/` | Regenerated on demand; safe to lose. |
+| **Thumbnails** | Inside the backend container at `/app/.thumbnail_cache/` | Keyed by file hash; regenerated on demand; safe to lose. |
 | **Embedding model weights** | `torch_cache` volume | DINOv2 ViT-S/14 (~90MB). Persisted so rebuilds don't re-download. |
 | **Prometheus metrics** | `prometheus_data` volume | 15 days retention. |
 
@@ -157,8 +157,11 @@ open http://localhost:6333/dashboard
 | `GET` | `/browse?path=...` | List subdirectories for folder picker |
 | `POST` | `/rescan` | Scan default folder for changes |
 | `POST` | `/process-pending` | Resume embedding generation |
-| `POST` | `/deduplicate` | Move photos to trash + clean DB/Qdrant |
-| `GET` | `/similarity-groups` | Compute groups on-demand from Qdrant |
+| `POST` | `/deduplicate` | Move selected photos to trash + clean DB/Qdrant |
+| `POST` | `/auto-deduplicate` | Sweep duplicate clusters, keep earliest copy in a folder (supports `dry_run`) |
+| `GET` | `/trash` | List recoverable trashed files |
+| `POST` | `/trash/recover` | Restore trashed files + rebuild DB/Qdrant from manifest |
+| `GET` | `/similarity-groups` | Compute groups on-demand from the similarity index |
 | `GET` | `/thumbnails/{id}` | Cached thumbnail (JPEG) |
 | `GET` | `/photos/{id}/full` | Full-res photo (HEIC auto-transcoded to JPEG) |
 | `GET` | `/job-queue/status` | Current queue state |

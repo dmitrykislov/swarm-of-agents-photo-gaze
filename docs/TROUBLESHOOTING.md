@@ -41,7 +41,7 @@ docker-compose ps
 
 # If not running, start it
 
-docker-compose up -d backend
+docker-compose up -d fastapi
 
 
 
@@ -197,7 +197,7 @@ docker-compose logs qdrant
 
 **Causes**:
 
-- Embedding generation is slow (GPU not available)
+- Embedding generation is CPU-bound (no GPU is used; ~40 photos/min in Docker)
 
 - Large number of photos
 
@@ -212,17 +212,17 @@ docker-compose logs qdrant
 ```bash
 
 # Check backend logs for errors
-docker-compose logs backend | tail -50
+docker-compose logs fastapi | tail -50
 
 
 
-# Check if GPU is available (if using CUDA)
-docker-compose exec backend nvidia-smi
+# Is it actually progressing? (embeddings are CPU-bound, ~40/min)
+curl -s http://localhost:8000/stats | jq '{completed, pending, failed}'
 
 
 
-# Restart backend service
-docker-compose restart backend
+# Restart the backend service
+docker-compose restart fastapi
 
 
 
@@ -279,7 +279,7 @@ services:
 
 
 # Monitor memory usage
-docker stats backend
+docker stats fastapi_app
 
 ```
 
@@ -314,23 +314,23 @@ docker stats backend
 ```bash
 
 # Check migration status
-docker-compose exec backend alembic current
+docker-compose exec fastapi alembic current
 
 
 
 # View migration history
-docker-compose exec backend alembic history
+docker-compose exec fastapi alembic history
 
 
 
 # Manually run migrations
-docker-compose exec backend alembic upgrade head
+docker-compose exec fastapi alembic upgrade head
 
 
 
 # If migration is stuck, downgrade and retry
-docker-compose exec backend alembic downgrade -1
-docker-compose exec backend alembic upgrade head
+docker-compose exec fastapi alembic downgrade -1
+docker-compose exec fastapi alembic upgrade head
 
 ```
 
@@ -366,45 +366,35 @@ docker-compose exec backend alembic upgrade head
 
 
 
+A bare **"Failed to fetch"** in the UI is almost always a port/CORS mismatch.
+
 ```bash
+# 1) Is the backend up on the configured port? (FASTAPI_PORT, default 8000)
+curl http://localhost:8000/health        # -> {"status":"healthy"}
 
-# Check if backend is running
-curl http://localhost:8000/health
-
-
-
-# Verify REACT_APP_API_URL in .env
-cat .env | grep REACT_APP_API_URL
-
-
-
-# Check browser console for CORS errors
-
-# Open DevTools (F12) → Console tab
-
-
-
-# If CORS error, backend needs to allow frontend origin
-
-# Add to app/main.py:
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-
-    CORSMiddleware,
-
-    allow_origins=["http://localhost:3000"],
-
-    allow_credentials=True,
-
-    allow_methods=["*"],
-
-    allow_headers=["*"],
-
-)
-
+# 2) The UI's backend URL is BAKED INTO THE BUNDLE AT BUILD TIME from
+#    REACT_APP_API_URL (a docker build arg derived from FASTAPI_PORT in
+#    start.sh) — editing .env at runtime does NOT change it. If you changed
+#    FASTAPI_PORT, rebuild the frontend so it points at the new port:
+docker compose up -d --build react       # or ./start.sh
 ```
+
+CORS itself should not be the problem: the backend allows **any
+`localhost`/`127.0.0.1` origin on any port** (so the UI works regardless of
+`REACT_PORT`). The relevant config in `app/main.py` is:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_extra,  # optional extra origins via CORS_ORIGINS
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+For a non-localhost host, add it via the `CORS_ORIGINS` env var (comma-separated).
 
 
 
@@ -447,7 +437,7 @@ wscat -c ws://localhost:8000/ws/progress/test-job-id
 
 
 # Check backend logs for WebSocket errors
-docker-compose logs backend | grep -i websocket
+docker-compose logs fastapi | grep -i websocket
 
 
 
@@ -497,12 +487,12 @@ curl http://localhost:8000/health
 
 
 # Check if path exists on backend
-docker-compose exec backend ls -la /path/to/folder
+docker-compose exec fastapi ls -la /path/to/folder
 
 
 
 # Check backend permissions
-docker-compose exec backend stat /path/to/folder
+docker-compose exec fastapi stat /path/to/folder
 
 
 
@@ -557,7 +547,7 @@ services:
 
 
 # Verify images are readable
-docker-compose exec backend ls -la /path/to/folder/*.jpg
+docker-compose exec fastapi ls -la /path/to/folder/*.jpg
 
 
 
@@ -590,9 +580,9 @@ convert image.bmp image.jpg  # ImageMagick
 
 - JavaScript error in ThresholdInput component
 
-- Backend /search endpoint is failing
+- The /similarity-groups request is failing
 
-- No similarity groups to display
+- No similarity groups to display (index not built yet, or threshold too high)
 
 
 
@@ -608,23 +598,21 @@ convert image.bmp image.jpg  # ImageMagick
 
 
 
-# Verify /search endpoint is working
-curl -X POST http://localhost:8000/search \
-
-  -H "Content-Type: application/json" \
-
-  -d '{"threshold": 0.75}'
+# Verify the similarity-groups endpoint is working (lower the threshold to
+# see more; the index floor is 0.70). Groups are global — no job id needed.
+curl -s "http://localhost:8000/similarity-groups?min_similarity=0.85" | jq '.total'
 
 
 
-# Check if similarity groups exist
+# If 0, check the index is built and photos are embedded
+curl -s http://localhost:8000/stats | jq '{embeddings, similarity_index}'
 
-# Run a rescan job first
+# Run a scan first if there are no embeddings
 
 
 
 # Check frontend logs
-docker-compose logs frontend
+docker-compose logs react
 
 ```
 
@@ -735,43 +723,28 @@ rm -rf backups/old-*
 
 
 
-**Causes**:
-
-- GPU is not available (using CPU fallback)
-
-- GPU memory is insufficient
-
-- Other processes are using GPU
-
-
+**Expected throughput**: embeddings run on **CPU inside Docker** at ~40
+photos/min. There is no CUDA/GPU path in the standard image — the model is
+DINOv2 ViT-S/14 and the only acceleration available is Apple **MPS** when
+running the backend **natively** on Apple Silicon (much faster than the
+containerized CPU run). So "slow" is usually just the CPU baseline for a large
+batch.
 
 **Solutions**:
 
-
-
 ```bash
+# Confirm which device the model picked (mps / cuda / cpu)
+docker compose exec fastapi python -c \
+  "from app.embedding_generator import EmbeddingGenerator as E; print(E()._detect_device())"
 
-# Check if GPU is available
-docker-compose exec backend python -c "import torch; print(torch.cuda.is_available())"
-
-
-
-# Check GPU memory
-docker-compose exec backend nvidia-smi
-
-
-
-# If GPU is not available, install CUDA drivers
-
-# See: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
-
-
-
-# Reduce batch size in app/orchestrator.py
-
-BATCH_SIZE = 4  # Decrease from default
-
+# Watch progress — it's working, just CPU-bound
+curl -s http://localhost:8000/stats | jq '{completed, pending, failed}'
 ```
+
+To go faster, run the backend natively on an Apple Silicon Mac (it will use
+MPS automatically) instead of in Docker. The job processes ~2 photos
+concurrently (a semaphore in `job_queue.py`); raising it rarely helps on CPU
+and can starve the event loop.
 
 
 
@@ -817,9 +790,8 @@ services:
 
 
 
-# Use pagination to limit results
-
-# Implement in /search endpoint
+# Use pagination to limit results (already supported)
+curl -s "http://localhost:8000/similarity-groups?skip=0&limit=50" | jq '.total'
 
 ```
 
@@ -869,7 +841,7 @@ services:
 
 # Check Qdrant collection size
 
-curl http://localhost:6333/collections/photo_embeddings
+curl http://localhost:6333/collections/embeddings
 
 ```
 
@@ -900,7 +872,7 @@ curl http://localhost:6333/collections/photo_embeddings
 ```bash
 
 # Check backend logs for errors
-docker-compose logs backend | grep -i error
+docker-compose logs fastapi | grep -i error
 
 
 
@@ -939,12 +911,12 @@ identify /path/to/photo.jpg  # ImageMagick
 ```bash
 
 # Check backup manager logs
-docker-compose logs backend | grep -i backup
+docker-compose logs fastapi | grep -i backup
 
 
 
 # Verify backup directory exists and is writable
-docker-compose exec backend ls -la /backups
+docker-compose exec fastapi ls -la /backups
 
 
 
@@ -980,7 +952,7 @@ curl http://localhost:8000/backup/status
 
 
 # Verify backup file exists
-docker-compose exec backend ls -la /backups/backup-*
+docker-compose exec fastapi ls -la /backups/backup-*
 
 
 
