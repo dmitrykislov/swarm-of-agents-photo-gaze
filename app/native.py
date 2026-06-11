@@ -92,6 +92,34 @@ def start_qdrant_sidecar(binary: str, storage_dir: str, http_port: int):
     )
 
 
+def raise_file_limit():
+    """Raise this process's open-file (RLIMIT_NOFILE) soft limit as high as the
+    hard limit allows. macOS launches GUI apps (Finder/Dock) with a soft limit
+    of just 256 — far too few for Qdrant, which opens many RocksDB segment
+    files. When it runs out it fails with 'RocksDB ... IO error: While open a
+    file' and then can't recover, so every embedding upsert errors out. The
+    child Qdrant sidecar inherits whatever limit we set here. Returns the new
+    soft limit (or None if unavailable, e.g. on Windows)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # Try progressively smaller targets — the kernel caps the achievable value
+    # (kern.maxfilesperproc), so we take the highest that actually sticks.
+    for want in (65536, 49152, 24576, 16384, 10240, 4096):
+        if want <= soft:
+            break
+        cap = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (cap, hard))
+            soft = cap
+            break
+        except (ValueError, OSError):
+            continue
+    return soft
+
+
 def app_already_running(port: int) -> bool:
     """True if a Photo Gaze server is already answering on this port. Lets a
     second launch (double-click) just focus the existing instance instead of
@@ -166,6 +194,13 @@ def main() -> None:
         print(f"Photo Gaze is already running at http://127.0.0.1:{api_port}")
         webbrowser.open(f"http://127.0.0.1:{api_port}")
         return
+
+    # Raise the open-file limit BEFORE launching Qdrant — the sidecar inherits
+    # it, and 256 (macOS GUI default) starves RocksDB into an unrecoverable
+    # IO error during any sizeable scan.
+    limit = raise_file_limit()
+    if limit is not None:
+        print(f"open-file limit: {limit}")
 
     # Qdrant sidecar on its own free port (backend reads QDRANT_URL at startup).
     qbin = os.getenv("QDRANT_BINARY", bundled("qdrant"))

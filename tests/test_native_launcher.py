@@ -55,6 +55,22 @@ def test_qdrant_sidecar_none_without_binary(tmp_path):
     assert native.start_qdrant_sidecar(str(tmp_path / "missing"), str(tmp_path / "q"), 7000) is None
 
 
+def test_raise_file_limit_lifts_a_low_soft_limit():
+    """Qdrant starves at the macOS GUI default of 256 fds; the launcher must
+    raise the soft limit. Simulate the low default and check it climbs."""
+    import resource
+
+    orig_soft, orig_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        # Drop the soft limit low (always allowed), then let the launcher lift it.
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, orig_hard))
+        new_soft = native.raise_file_limit()
+        assert new_soft is not None and new_soft > 256
+        assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] > 256
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (orig_soft, orig_hard))
+
+
 def test_configure_environment_sets_sqlite_and_backend(tmp_path, monkeypatch):
     # Clear anything that would pre-empt setdefault.
     for k in ("DATABASE_URL", "DINOV2_ONNX_PATH", "EMBEDDING_BACKEND",
