@@ -64,12 +64,29 @@ Everything lives in **one folder**:
 Your **original photos stay where they are** on disk and are never modified.
 
 ### Stopping & restarting
-- **Quit** the app (close it / Cmd-Q) → the internal server and vector engine
-  stop. **Nothing is lost** — everything is on disk in the folder above.
+- **Quit** the app (close it / Cmd-Q, or force-quit) → the internal server and
+  vector engine stop. **Nothing is lost** — everything is on disk in the folder
+  above. A hard force-quit is safe: the next launch reaps any leftover vector
+  engine and reclaims its storage lock automatically.
 - **Next launch** reads that folder back, so all your registered folders,
-  embeddings, and duplicate groups are exactly as you left them.
-- If a scan was interrupted, the **Processing Status** panel shows
-  *“Resume processing”* to finish the remaining photos.
+  embeddings, and duplicate groups are exactly as you left them. If a scan was
+  interrupted, it **resumes the remaining photos automatically** (and the
+  **Processing Status** panel also offers *“Resume processing”* if you stopped
+  it yourself).
+- **Launching twice** just refocuses the existing window — it won't start a
+  second copy.
+
+### Start fresh (reset the database)
+If you ever want a clean slate — empty index, no registered folders — quit the
+app and delete its data folder, then relaunch:
+
+```bash
+rm -rf "$HOME/Library/Application Support/PhotoGaze"
+```
+
+This only clears the app's **index** (the duplicate-detection database, vectors,
+thumbnails). **Your original photos are never touched**, and anything in trash
+that you already recovered stays on disk. Re-add your folders and scan again.
 
 ### Uninstall (native)
 1. Delete `Photo Gaze.app` (drag to Trash).

@@ -14,6 +14,12 @@ starts uvicorn on a fixed loopback port (`PHOTO_GAZE_PORT`, default 8765),
 opens your browser, and shuts the sidecar down on exit. Data lives in
 `~/Library/Application Support/PhotoGaze/`.
 
+For robustness it also: refuses to start a second copy if one is already
+serving the port (just reopens the browser); reaps any orphaned sidecar from a
+previous hard-kill before launch (a survivor would hold the storage lock); and
+stops the sidecar with a SIGTERM→SIGKILL escalation so a wedged process can't
+linger. So a force-quit is safe — the next launch cleans up after it.
+
 ## Build it
 
 On an Apple-Silicon Mac (Python 3.10+, Node 18+; `torch` only needed once, to
