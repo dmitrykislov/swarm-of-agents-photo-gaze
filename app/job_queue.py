@@ -137,12 +137,25 @@ class JobQueueManager:
             session = self.SessionLocal()
             photo = session.query(Photo).filter(Photo.id == photo_id).first()
             file_path = photo.file_path if photo else None
+            already_embedded = (
+                photo is not None
+                and session.query(Embedding.id)
+                .filter(Embedding.photo_id == photo_id).first() is not None
+            )
             session.close()
             if not file_path:
                 # Photo row gone — nothing to retry. Count it as handled so
                 # the batch can still reach completion.
                 await self._record_finished(job_id)
                 return False
+            if already_embedded:
+                # Idempotency guard: this photo already has a vector. Without
+                # it, a second /process-pending (double-click, or auto-resume
+                # racing a manual resume) would queue the same photo again and
+                # create a DUPLICATE embedding + Qdrant point — the photo then
+                # matches itself at 1.0 and shows up as its own "duplicate".
+                await self._record_finished(job_id)
+                return True
 
             # Extract metadata from photo file
             metadata = await self.metadata_extractor.extract(file_path)
@@ -367,10 +380,33 @@ class JobQueueManager:
                 recovered_id = incomplete_job.job_id
                 recovered_processed = incomplete_job.processed_photos
                 recovered_checkpoint = incomplete_job.checkpoint_count
-                recovered_total = incomplete_job.total_photos
+
+                # Which photos are still pending? Re-queueing these is what
+                # makes recovery actually RESUME. Before, recovery only flipped
+                # the job back to "processing" and stopped — the pending photos
+                # were never re-queued and the job never completed, so it sat as
+                # a permanent "processing" ghost (and /stats over-counted).
+                pending_ids = [
+                    row[0] for row in session.query(Photo.id)
+                    .join(ProcessingState, ProcessingState.photo_id == Photo.id)
+                    .filter(ProcessingState.status == "pending")
+                    .all()
+                ]
+                # Anchor the total to processed + still-pending so _record_finished
+                # flips the job to "completed" exactly when the last one lands.
+                recovered_total = recovered_processed + len(pending_ids)
                 print(f"Recovering job {recovered_id}: ",
-                      f"{recovered_processed}/{recovered_total} photos processed")
-                # Restore job state to in-memory tracking
+                      f"{recovered_processed} done, {len(pending_ids)} to resume")
+
+                if not pending_ids:
+                    # Nothing left — don't leave a zombie "processing" row.
+                    incomplete_job.status = "completed"
+                    incomplete_job.completed_at = datetime.utcnow()
+                    incomplete_job.updated_at = datetime.utcnow()
+                    session.commit()
+                    session.close()
+                    return None
+
                 self.active_jobs[recovered_id] = {
                     "status": "processing",
                     "processed_photos": recovered_processed,
@@ -378,12 +414,17 @@ class JobQueueManager:
                     "total_photos": recovered_total,
                     "finished": recovered_processed,
                 }
-                # Update job status to processing
                 incomplete_job.status = "processing"
+                incomplete_job.total_photos = recovered_total
                 incomplete_job.started_at = datetime.utcnow()
                 incomplete_job.updated_at = datetime.utcnow()
                 session.commit()
                 session.close()
+
+                # Fire the resume tasks (idempotent: process_photo skips any
+                # photo that already has an embedding).
+                for pid in pending_ids:
+                    asyncio.create_task(self.process_photo(recovered_id, pid))
                 return recovered_id
             session.close()
             return None

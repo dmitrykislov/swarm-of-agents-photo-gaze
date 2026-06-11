@@ -102,14 +102,25 @@ class BackupManager:
         # Parse database URL
         db_url = self.database_url
         if db_url.startswith("sqlite"):
-            # For SQLite, just copy the database file
             db_file = db_url.replace("sqlite:///", "")
             if not db_file:
                 logger.warning("SQLite database path is empty after URL parsing")
                 return
             if os.path.exists(db_file):
-                import shutil
-                shutil.copy(db_file, backup_path / "database.db")
+                # Use SQLite's online backup API, NOT a file copy: under WAL
+                # mode recent commits live in the -wal sidecar and a plain copy
+                # of just the .db misses them. .backup() produces a single,
+                # consistent snapshot file with all committed data folded in.
+                import sqlite3
+                src = sqlite3.connect(db_file)
+                try:
+                    dst = sqlite3.connect(str(backup_path / "database.db"))
+                    try:
+                        src.backup(dst)
+                    finally:
+                        dst.close()
+                finally:
+                    src.close()
             return
         
         # Extract PostgreSQL connection parameters
@@ -186,7 +197,13 @@ class BackupManager:
                     points, next_offset = client.scroll(
                         collection_name=self.qdrant_collection,
                         limit=limit,
-                        offset=offset
+                        offset=offset,
+                        # qdrant-client defaults with_vectors=False — without
+                        # this every point serializes as "vector": null and the
+                        # restore rebuilds an empty index. The vectors ARE the
+                        # backup.
+                        with_vectors=True,
+                        with_payload=True,
                     )
                     
                     if not points:
@@ -272,6 +289,12 @@ class BackupManager:
             import shutil
             try:
                 shutil.copy(backup_path / "database.db", db_file)
+                # Drop any stale WAL sidecars from the previous database — left
+                # in place they'd be replayed over the freshly restored file,
+                # reintroducing the very data we just rolled back.
+                for sidecar in (db_file + "-wal", db_file + "-shm"):
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
                 logger.info("SQLite restored from backup")
             except FileNotFoundError:
                 logger.error("SQLite backup file not found: %s", backup_path / "database.db")

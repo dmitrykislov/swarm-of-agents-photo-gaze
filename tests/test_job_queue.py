@@ -207,12 +207,13 @@ class TestJobQueueManager:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_recover_from_checkpoint(self, job_queue):
-        """Verify state recovery restores incomplete job from last checkpoint."""
+        """Verify recovery restores the incomplete job AND re-queues the photos
+        still pending (true resume — not a permanent 'processing' ghost)."""
         job_id = "test_job_007"
-        job_queue.create_job(job_id, 15)
-        self._seed_photos(job_queue, 7)
+        job_queue.create_job(job_id, 10)
+        self._seed_photos(job_queue, 10)         # 10 photos, all pending
 
-        for i in range(7):
+        for i in range(7):                        # finish 7 → 3 remain pending
             await job_queue.process_photo(job_id, photo_id=i + 1)
 
         # New manager instance (simulating restart) — reopen the same DB file.
@@ -220,12 +221,18 @@ class TestJobQueueManager:
              patch("app.job_queue.MetadataExtractor"), \
              patch("app.job_queue.QdrantClient"):
             new_manager = JobQueueManager(database_url=job_queue.database_url)
+        # Observe the re-queue without running the real pipeline.
+        new_manager.process_photo = AsyncMock(return_value=True)
 
         recovered_job_id = await new_manager.recover_from_checkpoint()
+        await asyncio.sleep(0)                     # let the resume tasks start
+
         assert recovered_job_id == job_id
         assert job_id in new_manager.active_jobs
         assert new_manager.active_jobs[job_id]["processed_photos"] == 7
         assert new_manager.active_jobs[job_id]["checkpoint_count"] == 1
+        # The 3 still-pending photos must be re-queued so the job can finish.
+        assert new_manager.process_photo.await_count == 3
 
     @pytest.mark.unit
     @pytest.mark.asyncio

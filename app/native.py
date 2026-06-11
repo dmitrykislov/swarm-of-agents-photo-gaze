@@ -92,6 +92,50 @@ def start_qdrant_sidecar(binary: str, storage_dir: str, http_port: int):
     )
 
 
+def app_already_running(port: int) -> bool:
+    """True if a Photo Gaze server is already answering on this port. Lets a
+    second launch (double-click) just focus the existing instance instead of
+    crashing on a port-in-use bind."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
+            return r.status < 500
+    except Exception:
+        return False
+
+
+def stop_sidecar(proc) -> None:
+    """Stop the Qdrant sidecar, escalating SIGTERM -> SIGKILL. A bare
+    terminate() can hang a wedged process forever, orphaning it AND leaving the
+    storage lock held so the next launch can't start."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return  # already gone
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def kill_stray_sidecars(binary: str) -> None:
+    """Reap orphaned Qdrant sidecars from THIS bundle left by a previous hard
+    kill (Dock force-quit SIGKILLs a non-Cocoa app, so our atexit never runs).
+    A survivor keeps the storage lock and the next launch fails to start —
+    matching by the full bundled binary path so we never touch unrelated
+    Qdrants. Best-effort: pkill may be absent."""
+    if not binary:
+        return
+    try:
+        subprocess.run(["pkill", "-f", binary],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def configure_environment(base: str) -> None:
     """Point the FastAPI app at SQLite, the bundled ONNX model and React build,
     all before app.main is imported. setdefault so explicit env (dev/tests)
@@ -117,13 +161,22 @@ def main() -> None:
     base = data_dir()
     api_port = int(os.getenv("PHOTO_GAZE_PORT") or DEFAULT_API_PORT)
 
+    # Single instance: if we're already running, just reopen the browser.
+    if app_already_running(api_port):
+        print(f"Photo Gaze is already running at http://127.0.0.1:{api_port}")
+        webbrowser.open(f"http://127.0.0.1:{api_port}")
+        return
+
     # Qdrant sidecar on its own free port (backend reads QDRANT_URL at startup).
     qbin = os.getenv("QDRANT_BINARY", bundled("qdrant"))
+    # Reap any orphaned sidecar from a prior hard-kill — it would still hold the
+    # storage lock and prevent ours from starting.
+    kill_stray_sidecars(qbin)
     qport = find_free_port()
     proc = start_qdrant_sidecar(qbin, os.path.join(base, "qdrant"), qport)
     if proc is not None:
         os.environ["QDRANT_URL"] = f"http://127.0.0.1:{qport}"
-        atexit.register(proc.terminate)
+        atexit.register(stop_sidecar, proc)
         if not wait_for_http(f"http://127.0.0.1:{qport}/readyz", timeout=30):
             print("WARNING: Qdrant sidecar did not become ready in time", file=sys.stderr)
     os.environ.setdefault("QDRANT_URL", "http://127.0.0.1:6333")

@@ -244,6 +244,14 @@ async def process_pending_photos():
     """Queue all photos with pending processing state for embedding generation."""
     if job_queue_manager is None:
         return JSONResponse(status_code=503, content={"error": "Job queue not initialized"})
+    # Already processing? Refuse rather than queue the same pending photos under
+    # a second job — two batches racing the same photo create duplicate
+    # embeddings (the idempotency check can't catch a concurrent first-embed).
+    if job_queue_manager.active_jobs:
+        return JSONResponse(status_code=409, content={
+            "error": "Processing already in progress",
+            "active_jobs": list(job_queue_manager.active_jobs.keys()),
+        })
     from app.models import Photo as _Photo, ProcessingState as _PS
     session = job_queue_manager.SessionLocal()
     try:
@@ -910,7 +918,7 @@ async def _execute_dedupe(session, photo_ids: list) -> dict:
     # Incremental cache update — deletion only removes nodes/edges, so we
     # filter the in-memory index instead of a full Qdrant re-scroll + re-search
     # (which would block this request for minutes on a 300k-photo collection).
-    _remove_photos_from_cache(set(ids_to_purge))
+    await remove_photos_from_index(set(ids_to_purge))
 
     return {
         "deleted": deleted,
@@ -1368,7 +1376,7 @@ async def delete_folder(folder_id: int):
         # Incrementally drop the removed photos from the similarity index
         # (O(edges), no full Qdrant re-scroll) — see _remove_photos_from_cache.
         if photo_ids:
-            _remove_photos_from_cache(set(photo_ids))
+            await remove_photos_from_index(set(photo_ids))
 
         return {
             "deleted": folder_id,
@@ -1422,8 +1430,9 @@ async def rescan_folder(folder_path: str = None):
         })
     
     try:
-        # Initialize scanner and database session
-        scanner = FolderScanner()
+        # Initialize scanner and database session. Pass the Qdrant client so
+        # files deleted on disk have their vectors purged (not orphaned).
+        scanner = FolderScanner(qdrant_client=job_queue_manager.qdrant_client)
         session = job_queue_manager.SessionLocal()
         
         # Scan folder for changes (new, modified, deleted photos)
@@ -1650,6 +1659,19 @@ def _get_recompute_lock() -> asyncio.Lock:
     if _sim_recompute_lock is None:
         _sim_recompute_lock = asyncio.Lock()
     return _sim_recompute_lock
+
+
+async def remove_photos_from_index(deleted_pids: set) -> None:
+    """Lock-serialized wrapper around _remove_photos_from_cache.
+
+    Deletes (dedupe / folder removal) mutate _sim_cache; an incremental add
+    runs on an executor thread UNDER the recompute lock. Calling the sync
+    removal directly could interleave with that thread — racing the same numpy
+    arrays, or being overwritten when the in-flight add writes its (pre-delete)
+    snapshot back, resurrecting just-deleted photos. Taking the lock makes the
+    two mutually exclusive."""
+    async with _get_recompute_lock():
+        _remove_photos_from_cache(deleted_pids)
 
 
 def _compute_sim_cache():

@@ -71,9 +71,19 @@ class FolderScanner:
         ".orf", ".rw2", ".pef",      # Olympus/Panasonic/Pentax RAW
     }
     
-    def __init__(self):
-        """Initialize folder scanner."""
-        pass
+    def __init__(self, qdrant_client=None, qdrant_collection: str = "embeddings"):
+        """Initialize folder scanner.
+
+        Args:
+            qdrant_client: optional Qdrant client. When provided, photos whose
+                files were deleted on disk have their vectors purged from Qdrant
+                during cleanup — otherwise those vectors are orphaned forever
+                (the DB row + cascade go, but the vector lingers and can still
+                match new photos until a full index rebuild).
+            qdrant_collection: collection holding the embedding vectors.
+        """
+        self.qdrant_client = qdrant_client
+        self.qdrant_collection = qdrant_collection
     
     def scan_folder(self, folder_path: str, session: Session) -> Tuple[List[int], int]:
         """Recursively scan folder and queue photos with incremental change detection.
@@ -217,18 +227,43 @@ class FolderScanner:
         # /photos/abc.
         folder_prefix = folder_abs.rstrip(os.sep) + os.sep
 
-        deleted_count = 0
+        to_delete = []
         for photo in session.query(Photo).all():
             photo_abs = os.path.abspath(photo.file_path)
             under_folder = photo_abs == folder_abs or photo_abs.startswith(folder_prefix)
             if not under_folder:
                 continue  # belongs to a different folder — never touch it
             if photo.file_path not in scanned_paths:
-                # File is under this folder but gone from disk; remove it.
-                session.delete(photo)
-                deleted_count += 1
+                to_delete.append(photo)
 
-        return deleted_count
+        if not to_delete:
+            return 0
+
+        # Purge the vectors from Qdrant FIRST. session.delete cascades to the
+        # Embedding rows, but Qdrant is a separate store — without this the
+        # vectors are orphaned: they survive, keep matching new photos in the
+        # incremental index, and bloat storage. Delete vectors before the DB
+        # rows so a Qdrant failure leaves the (recoverable) DB rows intact.
+        from app.models import Embedding
+        point_ids = [
+            pid for (pid,) in session.query(Embedding.qdrant_point_id)
+            .filter(Embedding.photo_id.in_([p.id for p in to_delete]))
+            .filter(Embedding.qdrant_point_id.isnot(None))
+            .all()
+        ]
+        if point_ids and self.qdrant_client is not None:
+            try:
+                self.qdrant_client.delete(
+                    collection_name=self.qdrant_collection,
+                    points_selector=point_ids,
+                )
+            except Exception as e:
+                print(f"WARNING: failed to delete {len(point_ids)} orphaned Qdrant points: {e}")
+
+        for photo in to_delete:
+            session.delete(photo)
+
+        return len(to_delete)
     
     def _get_mime_type(self, file_ext: str) -> str:
         """Get MIME type for file extension.
