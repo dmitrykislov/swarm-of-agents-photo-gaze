@@ -58,7 +58,8 @@ def test_qdrant_sidecar_none_without_binary(tmp_path):
 def test_configure_environment_sets_sqlite_and_backend(tmp_path, monkeypatch):
     # Clear anything that would pre-empt setdefault.
     for k in ("DATABASE_URL", "DINOV2_ONNX_PATH", "EMBEDDING_BACKEND",
-              "TRASH_DIR", "BACKEND_PUBLIC_URL", "FRONTEND_DIR"):
+              "TRASH_DIR", "BACKEND_PUBLIC_URL", "FRONTEND_DIR",
+              "THUMBNAILS_DIR", "BACKUP_DIR"):
         monkeypatch.delenv(k, raising=False)
     base = str(tmp_path / "data")
     os.makedirs(base, exist_ok=True)
@@ -68,3 +69,8 @@ def test_configure_environment_sets_sqlite_and_backend(tmp_path, monkeypatch):
     # Empty → relative thumbnail URLs (same-origin UI, port-independent).
     assert os.environ["BACKEND_PUBLIC_URL"] == ""
     assert os.environ["DINOV2_ONNX_PATH"].endswith(os.path.join("models", "dinov2_vits14.onnx"))
+    # All writable dirs must be under the data dir — never the read-only bundle
+    # or a cwd-relative path (Finder launches with cwd="/").
+    assert os.environ["THUMBNAILS_DIR"] == os.path.join(base, "thumbnails")
+    assert os.environ["BACKUP_DIR"] == os.path.join(base, "backups")
+    assert os.environ["TRASH_DIR"] == os.path.join(base, "trash")

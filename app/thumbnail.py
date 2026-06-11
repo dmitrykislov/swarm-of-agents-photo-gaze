@@ -11,7 +11,9 @@ from typing import Optional, Tuple
 
 from PIL import Image
 
-# Default cache directory lives alongside the app
+# Default cache directory lives alongside the app (Docker). The native app
+# MUST override this (THUMBNAILS_DIR) to a writable user dir — writing inside
+# the .app bundle is read-only in /Applications AND breaks the code signature.
 DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", ".thumbnail_cache")
 
 
@@ -19,7 +21,9 @@ class ThumbnailService:
     """Generate and cache JPEG thumbnails on disk, keyed by (file_hash, size)."""
 
     def __init__(self, cache_dir: Optional[str] = None):
-        self.cache_dir = os.path.abspath(cache_dir or DEFAULT_CACHE_DIR)
+        self.cache_dir = os.path.abspath(
+            cache_dir or os.getenv("THUMBNAILS_DIR") or DEFAULT_CACHE_DIR
+        )
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def _cache_key(self, file_hash: str, size: Tuple[int, int]) -> str:

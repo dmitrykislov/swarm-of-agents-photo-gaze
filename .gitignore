@@ -63,3 +63,5 @@ models/
 # Native build inputs/outputs
 vendor/
 dist/
+
+.pyi-work/

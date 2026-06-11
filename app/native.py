@@ -79,11 +79,15 @@ def start_qdrant_sidecar(binary: str, storage_dir: str, http_port: int):
     os.makedirs(storage_dir, exist_ok=True)
     env = dict(os.environ)
     env["QDRANT__STORAGE__STORAGE_PATH"] = storage_dir
+    env["QDRANT__STORAGE__SNAPSHOTS_PATH"] = os.path.join(storage_dir, "snapshots")
     env["QDRANT__SERVICE__HTTP_PORT"] = str(http_port)
     env["QDRANT__SERVICE__GRPC_PORT"] = str(http_port + 1)
     env["QDRANT__TELEMETRY_DISABLED"] = "true"
+    # cwd = the data dir, NEVER the bundle: Qdrant writes cwd-relative files
+    # (.qdrant-initialized, snapshots/) that would otherwise land inside the
+    # .app — breaking the code signature and failing in a read-only install.
     return subprocess.Popen(
-        [binary], env=env, cwd=os.path.dirname(binary) or ".",
+        [binary], env=env, cwd=storage_dir,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -96,6 +100,11 @@ def configure_environment(base: str) -> None:
     os.environ.setdefault("DINOV2_ONNX_PATH", bundled("models", "dinov2_vits14.onnx"))
     os.environ.setdefault("EMBEDDING_BACKEND", "onnx")
     os.environ.setdefault("TRASH_DIR", os.path.join(base, "trash"))
+    # These default to RELATIVE paths, which resolve against the cwd. Launched
+    # from Finder the cwd is "/" (read-only) → startup crash. Pin them to the
+    # writable data dir (also keeps writes out of the read-only .app bundle).
+    os.environ.setdefault("THUMBNAILS_DIR", os.path.join(base, "thumbnails"))
+    os.environ.setdefault("BACKUP_DIR", os.path.join(base, "backups"))
     # Empty → thumbnail links are RELATIVE ("/thumbnails/..."), so the
     # same-origin UI reaches them on whatever port we end up on.
     os.environ.setdefault("BACKEND_PUBLIC_URL", "")

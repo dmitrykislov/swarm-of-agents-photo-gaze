@@ -38,17 +38,38 @@ else
   echo "      vendor/qdrant present — skipping download."
 fi
 
-echo "[4/5] PyInstaller bundle…"
+echo "[4/6] PyInstaller bundle…"
 python -m pip install --quiet --upgrade pyinstaller
 python -m pip install --quiet -r requirements-native.txt
-pyinstaller --noconfirm photogaze.spec
+# --workpath MUST NOT be ./build (PyInstaller's default) — that's the React
+# build dir, which the spec bundles; a collision would pack PyInstaller's work
+# files into the app.
+pyinstaller --noconfirm --workpath .pyi-work photogaze.spec
 
-echo "[5/5] Create the .dmg…"
+echo "[5/6] Deep ad-hoc re-sign…"
+# PyInstaller's per-file signing leaves an inconsistent seal on a .app, which
+# macOS reports as "damaged" (right-click→Open can't bypass that). A single
+# deep ad-hoc signature over the assembled bundle makes the seal valid, so the
+# app gets the normal "unidentified developer" treatment instead.
+# (Do NOT launch the app before this step — running it can write files into the
+#  bundle and break the seal again; thumbnails/data go to ~/Library, not here.)
+codesign --force --deep --sign - "dist/Photo Gaze.app"
+codesign --verify --deep --strict "dist/Photo Gaze.app" \
+  && echo "      signature valid" || { echo "      signature INVALID"; exit 1; }
+
+echo "[6/6] Create the .dmg…"
 rm -f "dist/PhotoGaze.dmg"
 hdiutil create -volname "Photo Gaze" -srcfolder "dist/Photo Gaze.app" \
   -ov -format UDZO "dist/PhotoGaze.dmg"
 
-echo
-echo "Done:"
-echo "  app: dist/Photo Gaze.app"
-echo "  dmg: dist/PhotoGaze.dmg   (unsigned — first run: right-click → Open)"
+cat <<'NOTE'
+
+Done:
+  app: dist/Photo Gaze.app
+  dmg: dist/PhotoGaze.dmg
+
+The app is UNSIGNED (ad-hoc). To run it the first time, EITHER:
+  • right-click the app → Open → Open, OR
+  • clear the download quarantine after copying it out of the .dmg:
+        xattr -dr com.apple.quarantine "/Applications/Photo Gaze.app"
+NOTE
