@@ -30,7 +30,12 @@ function App() {
   const [folders, setFolders] = useState<FolderEntry[]>([]);
   const [folderError, setFolderError] = useState<string>('');
   const [processingStalled, setProcessingStalled] = useState(false);
-  const lastCompletedRef = useRef<{ value: number; stalledCount: number }>({ value: -1, stalledCount: 0 });
+  // Tracks the last time processing made progress (completed/pending moved).
+  // "Paused" is only shown after a long no-progress window — not a quick poll
+  // count — so slow embedding doesn't falsely flip the UI to Paused.
+  const lastProgressRef = useRef<{ completed: number; pending: number; at: number }>({ completed: -1, pending: -1, at: 0 });
+  // Last similarity-index rebuild time we've seen, to refresh the grid live.
+  const lastIndexAtRef = useRef<string | null>(null);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browseData, setBrowseData] = useState<BrowseResult | null>(null);
   const [browseLoading, setBrowseLoading] = useState(false);
@@ -125,17 +130,29 @@ function App() {
         const s = await fetchStats();
         if (!cancelled) {
           setStats(s);
-          // Detect stalled processing: if pending > 0 but completed hasn't
-          // changed for 3 consecutive polls (~9s), show the Resume button.
+
+          // Show new duplicate groups AS photos are processed: the backend
+          // rebuilds the index periodically during a long scan; whenever that
+          // timestamp advances, refresh the results grid.
+          const idxAt = s.similarity_index?.last_recompute_at ?? null;
+          if (idxAt && idxAt !== lastIndexAtRef.current) {
+            lastIndexAtRef.current = idxAt;
+            setGridRefresh((x) => x + 1);
+          }
+
+          // "Paused" only after ~30s of NO progress (neither completed nor
+          // pending moved). Slow embedding still counts as progress, so this
+          // won't falsely flip to Paused.
           if (s.pending > 0) {
-            if (s.completed === lastCompletedRef.current.value) {
-              lastCompletedRef.current.stalledCount++;
-            } else {
-              lastCompletedRef.current = { value: s.completed, stalledCount: 0 };
+            const r = lastProgressRef.current;
+            if (s.completed !== r.completed || s.pending !== r.pending) {
+              lastProgressRef.current = { completed: s.completed, pending: s.pending, at: Date.now() };
+              setProcessingStalled(false);
+            } else if (Date.now() - r.at > 30000) {
+              setProcessingStalled(true);
             }
-            setProcessingStalled(lastCompletedRef.current.stalledCount >= 3);
           } else {
-            lastCompletedRef.current = { value: s.completed, stalledCount: 0 };
+            lastProgressRef.current = { completed: s.completed, pending: 0, at: Date.now() };
             setProcessingStalled(false);
           }
         }
@@ -413,7 +430,8 @@ function App() {
                                 const r = await stopProcessing();
                                 setRescanStatus(r.message);
                                 setProcessingStalled(true);
-                                lastCompletedRef.current = { value: -1, stalledCount: 3 };
+                                // Force the paused state to stick: mark "no progress since long ago".
+                                lastProgressRef.current = { completed: stats?.completed ?? -1, pending: stats?.pending ?? 0, at: 0 };
                               } catch (e) {
                                 setRescanStatus(`Failed to stop: ${e instanceof Error ? e.message : e}`);
                               }
@@ -441,7 +459,7 @@ function App() {
                             onClick={async () => {
                               setRescanStatus('Queuing...');
                               setProcessingStalled(false);
-                              lastCompletedRef.current = { value: -1, stalledCount: 0 };
+                              lastProgressRef.current = { completed: -1, pending: -1, at: Date.now() };
                               try {
                                 const r = await processPending();
                                 setRescanStatus(`${r.message}: ${r.queued ?? 0} queued`);

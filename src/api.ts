@@ -109,6 +109,12 @@ export interface ProcessingStats {
   completed: number;
   pending: number;
   failed: number;
+  similarity_index?: {
+    last_recompute_at: string | null;
+    vectors_in_index: number;
+    edges_in_index: number;
+    recompute_running: boolean;
+  };
 }
 
 export async function fetchStats(): Promise<ProcessingStats> {

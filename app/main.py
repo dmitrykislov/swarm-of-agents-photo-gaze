@@ -1623,7 +1623,9 @@ def _read_image_info(file_path: str) -> tuple:
 _sim_cache: Dict[str, object] = {"data": None, "meta": None}
 _sim_debounce_handle: Optional[asyncio.TimerHandle] = None
 _sim_recompute_lock: Optional[asyncio.Lock] = None
-_SIM_DEBOUNCE_SECONDS = 60.0
+_SIM_DEBOUNCE_SECONDS = 8.0       # fold changes in after this much quiet
+_SIM_MAX_COALESCE_SECONDS = 25.0  # ...but during a continuous scan, update at
+                                  # least this often so groups appear live
 _SIM_SCROLL_PAGE = 2000          # Qdrant scroll page size
 _SIM_CACHE_THRESHOLD = 0.70      # adjacency floor; UI thresholds are >= this
 _SIM_TOP_K = 100                 # max neighbours stored per photo
@@ -1811,16 +1813,21 @@ async def _recompute_sim_cache():
 _pending_new_pids: set = set()
 
 
-def notify_embeddings_changed(photo_id: Optional[int] = None):
-    """Call after an embedding is added/updated. Debounces: folds the changes
-    into the index once after _SIM_DEBOUNCE_SECONDS of quiet, so a long batch
-    scan triggers a single update when it finishes idle, not one per photo.
+_pending_first_at: Optional[float] = None  # loop time when the current batch started
 
-    Pass the photo_id so the update can be INCREMENTAL — only the new photos
-    are searched and merged in (O(new) Qdrant searches), which is what keeps a
-    scan cheap when the existing collection holds 300k photos. Called with no
-    id, it falls back to a full recompute."""
-    global _sim_debounce_handle
+
+def notify_embeddings_changed(photo_id: Optional[int] = None):
+    """Call after an embedding is added/updated. Debounces the index update:
+    it fires after _SIM_DEBOUNCE_SECONDS of quiet, BUT no later than
+    _SIM_MAX_COALESCE_SECONDS after the batch started. The max-coalesce cap is
+    what makes duplicate groups appear progressively during a long, continuous
+    scan (otherwise the quiet-timer keeps resetting and nothing updates until
+    the scan finishes).
+
+    Pass the photo_id so the update is INCREMENTAL — only the new photos are
+    searched and merged in (O(new) Qdrant searches), keeping it cheap at 300k.
+    Called with no id, it falls back to a full recompute."""
+    global _sim_debounce_handle, _pending_first_at
     if photo_id is not None:
         _pending_new_pids.add(photo_id)
     try:
@@ -1828,11 +1835,16 @@ def notify_embeddings_changed(photo_id: Optional[int] = None):
     except RuntimeError:
         # No running loop (e.g. called from a sync test) — skip debounce
         return
-    # Cancel any pending debounce
+    now = loop.time()
+    if _pending_first_at is None:
+        _pending_first_at = now
+    # Normally wait for quiet; but if we've been accumulating for a while
+    # during a continuous scan, fire promptly so results show up live.
+    delay = 0.0 if (now - _pending_first_at) >= _SIM_MAX_COALESCE_SECONDS else _SIM_DEBOUNCE_SECONDS
     if _sim_debounce_handle is not None:
         _sim_debounce_handle.cancel()
     _sim_debounce_handle = loop.call_later(
-        _SIM_DEBOUNCE_SECONDS,
+        delay,
         lambda: asyncio.ensure_future(_apply_pending_changes()),
     )
 
@@ -1841,9 +1853,10 @@ async def _apply_pending_changes():
     """Debounce callback: incrementally add the photos accumulated since the
     last update, or fall back to a full recompute when there's no base index
     yet (cold start) or no specific additions were recorded."""
-    global _pending_new_pids
+    global _pending_new_pids, _pending_first_at
     pending = _pending_new_pids
     _pending_new_pids = set()
+    _pending_first_at = None  # restart the max-coalesce clock for the next batch
 
     if _sim_cache.get("data") is None or not pending:
         await _recompute_sim_cache()
