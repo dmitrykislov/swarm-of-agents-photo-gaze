@@ -1632,6 +1632,22 @@ def _read_image_info(file_path: str) -> tuple:
 _sim_cache: Dict[str, object] = {"data": None, "meta": None}
 _sim_debounce_handle: Optional[asyncio.TimerHandle] = None
 _sim_recompute_lock: Optional[asyncio.Lock] = None
+
+# Connected-components are memoized PER threshold, and the memo lives ON the
+# cache_data object (see _threshold_components_cached) — so when the index is
+# replaced (scan adds photos, a delete removes them) the new cache_data carries
+# a fresh, empty memo and a stale entry can never be served. The cap keeps
+# memory bounded regardless of collection size (each entry is the dup-graph
+# partition — ints only, far smaller than the group payloads it lets us skip).
+from collections import OrderedDict as _OrderedDict
+_COMPONENTS_MEMO_MAX = 16
+
+
+def _store_sim_cache(cache_data, photo_meta) -> None:
+    """Replace the cached index (and, implicitly, its components memo)."""
+    _sim_cache.update(data=cache_data, meta=photo_meta)
+
+
 _SIM_DEBOUNCE_SECONDS = 8.0       # fold changes in after this much quiet
 _SIM_MAX_COALESCE_SECONDS = 25.0  # ...but during a continuous scan, update at
                                   # least this often so groups appear live
@@ -1811,7 +1827,7 @@ async def _recompute_sim_cache():
         t0 = time.time()
         try:
             cache_data, photo_meta = await loop.run_in_executor(None, _compute_sim_cache)
-            _sim_cache.update(data=cache_data, meta=photo_meta)
+            _store_sim_cache(cache_data, photo_meta)
             n_vecs = len(cache_data["photo_ids"]) if cache_data else 0
             n_edges = int(cache_data["edge_arrays"][0].size) if cache_data else 0
             _sim_index_info.update(
@@ -1896,7 +1912,7 @@ async def _apply_pending_changes():
             if cache_data is None:
                 need_full_fallback = True
             else:
-                _sim_cache.update(data=cache_data, meta=photo_meta)
+                _store_sim_cache(cache_data, photo_meta)
                 _sim_index_info.update(
                     last_recompute_at=datetime.utcnow().isoformat(),
                     last_recompute_duration_ms=int((time.time() - t0) * 1000),
@@ -1923,7 +1939,7 @@ def _get_cached_data():
     if _sim_cache["data"] is not None:
         return _sim_cache["data"], _sim_cache["meta"]
     cache_data, photo_meta = _compute_sim_cache()
-    _sim_cache.update(data=cache_data, meta=photo_meta)
+    _store_sim_cache(cache_data, photo_meta)
     return cache_data, photo_meta
 
 
@@ -2060,6 +2076,31 @@ def _threshold_components(cache_data: dict, threshold: float) -> list:
             components.append(comp)
     components.sort(key=lambda c: c[0])
     return components
+
+
+def _threshold_components_cached(cache_data: dict, threshold: float) -> list:
+    """_threshold_components memoized by (index version, rounded threshold).
+
+    The slider's hot path re-requests the same threshold constantly — every
+    page change, and every time the user drags back over a value. Clustering
+    ~100k edges each time is what made the slider lag; this turns a repeat into
+    an O(1) dict lookup. The memo lives on cache_data, so when the index is
+    replaced the entries vanish with it (no stale results), and it's LRU-capped
+    so memory stays bounded no matter the collection size."""
+    memo = cache_data.get("__components_memo")
+    if memo is None:
+        memo = _OrderedDict()
+        cache_data["__components_memo"] = memo
+    key = round(float(threshold), 4)
+    hit = memo.get(key)
+    if hit is not None:
+        memo.move_to_end(key)
+        return hit
+    comps = _threshold_components(cache_data, threshold)
+    memo[key] = comps
+    while len(memo) > _COMPONENTS_MEMO_MAX:
+        memo.popitem(last=False)
+    return comps
 
 
 def _merge_new_edges(existing_arrays, new_directed_edges):
@@ -2323,99 +2364,177 @@ def _build_similarity_groups_from_qdrant(threshold: float):
     # sorted edge index, so this stays fast on 300k-photo collections even
     # though it runs on every threshold-slider tick.
     groups = []
-    for component in _threshold_components(cache_data, effective_threshold):
-        # Width / height / created_date are loaded on-demand by the lightbox
-        # via /photos/{id}/image-info — kept out of this hot path.
-        members = []
-        for j in component:
-            pid = photo_ids[j]
-            meta = photo_meta.get(pid) or {}
-            members.append({
-                "_idx": j,
-                "photo_id": pid,
-                "filename": meta.get("filename") or str(pid),
-                "path": f"{BACKEND_PUBLIC_URL}/thumbnails/{pid}",
-                "similarity_score": 0.0,  # placeholder, recomputed below
-                "quality_score": _quality_score(meta, max_effective_size),
-                "file_size": meta.get("file_size"),
-                "file_path": meta.get("file_path"),
-                "mime_type": meta.get("mime_type"),
-                "uploaded_at": meta.get("uploaded_at"),
-                "width": None,
-                "height": None,
-                "created_date": None,
-            })
-
-        if len(members) < 2:
-            continue
-
-        # Keeper ("★ Best") = quality-first, earliest-taken tiebreak — the
-        # same ranking auto-dedupe uses (see _keeper_key). Ascending sort,
-        # best first.
-        members.sort(key=_keeper_key)
-        ref = members[0]
-        others = members[1:]
-        ref_pid = ref["photo_id"]
-
-        # Score each member by exact cosine against the chosen reference.
-        # Vectors are unit-normalized, so dot product == cosine. This is
-        # always exact (no dependency on whether the (ref, m) edge happened
-        # to be in the sparse cache).
-        ref_idx = ref.pop("_idx")
-        ref["similarity_score"] = 1.0
-        ref_vec = vectors[ref_idx]
-        for m in others:
-            m_idx = m.pop("_idx")
-            m["similarity_score"] = float(np.dot(ref_vec, vectors[m_idx]))
-
-        avg_sim = sum(m["similarity_score"] for m in others) / max(1, len(others))
-
-        def _fmt_size(b):
-            if b >= 1_000_000:
-                return f"{b / 1_000_000:.2f} MB"
-            return f"{b / 1_000:.1f} KB"
-
-        ref_size = ref.get("file_size") or 0
-        reasons = []
-        if ref_size > 0 and others:
-            other_sizes = [(m.get("file_size") or 0) for m in others]
-            biggest_other = max(other_sizes)
-            if ref_size == biggest_other:
-                reasons.append(f"Identical file size: {_fmt_size(ref_size)}")
-                ref_name = ref.get("filename", "")
-                other_names = [m.get("filename", "") for m in others]
-                has_copy_suffix = any("(" in n or "copy" in n.lower() for n in other_names)
-                if has_copy_suffix and "(" not in ref_name and "copy" not in ref_name.lower():
-                    reasons.append(f"Filename \"{ref_name}\" appears to be the original (others have copy suffixes)")
-            elif ref_size > biggest_other:
-                pct = ((ref_size - biggest_other) / biggest_other * 100) if biggest_other > 0 else 0
-                reasons.append(f"Largest file: {_fmt_size(ref_size)} vs next {_fmt_size(biggest_other)} (+{pct:.0f}%)")
-            else:
-                reasons.append(f"File size: {_fmt_size(ref_size)} (a larger file exists at {_fmt_size(biggest_other)} but its format is less universal)")
-        if ref.get("mime_type"):
-            ref_fmt = ref["mime_type"]
-            # Coerce None/missing to "?" — Photo.mime_type is nullable in
-            # Postgres, and a mixed list of None and str crashes sorted().
-            other_fmts = sorted({(m.get("mime_type") or "?") for m in others})
-            is_preferred = ref_fmt in _PREFERRED_MIME_TYPES
-            fmt_note = "preferred (universal)" if is_preferred else "less universal"
-            reasons.append(f"Format: {ref_fmt} ({fmt_note}) — others: {', '.join(other_fmts)}")
-        if ref.get("uploaded_at"):
-            reasons.append(f"Scanned: {ref['uploaded_at'][:10]}")
-        if not reasons:
-            reasons.append("First in similarity ranking")
-
-        groups.append({
-            "group_id": f"grp-{ref_pid}",
-            "similarity_score": avg_sim,
-            # Group quality = the kept ("Best") photo's quality, i.e. the
-            # highest in the group. min_quality filters on this.
-            "quality_score": ref.get("quality_score", 0.0),
-            "reference_photo": ref,
-            "similar_photos": others,
-            "best_reasons": reasons,
-        })
+    for component in _threshold_components_cached(cache_data, effective_threshold):
+        g = _build_group_for_component(
+            component, vectors, photo_ids, photo_meta, max_effective_size
+        )
+        if g is not None:
+            groups.append(g)
     return groups
+
+
+def _build_group_for_component(component, vectors, photo_ids, photo_meta, max_effective_size):
+    """Build the full user-facing group dict for ONE component: members,
+    keeper/reference, exact pairwise cosine, and the 'why this copy' reasons.
+    Returns None for a singleton.
+
+    Extracted so the list endpoint can build this (the expensive part —
+    per-member dot products and string formatting) for ONLY the page being
+    shown, instead of every one of the hundreds of groups a low threshold
+    produces."""
+    # Width / height / created_date are loaded on-demand by the lightbox via
+    # /photos/{id}/image-info — kept out of this hot path.
+    members = []
+    for j in component:
+        pid = photo_ids[j]
+        meta = photo_meta.get(pid) or {}
+        members.append({
+            "_idx": j,
+            "photo_id": pid,
+            "filename": meta.get("filename") or str(pid),
+            "path": f"{BACKEND_PUBLIC_URL}/thumbnails/{pid}",
+            "similarity_score": 0.0,  # placeholder, recomputed below
+            "quality_score": _quality_score(meta, max_effective_size),
+            "file_size": meta.get("file_size"),
+            "file_path": meta.get("file_path"),
+            "mime_type": meta.get("mime_type"),
+            "uploaded_at": meta.get("uploaded_at"),
+            "width": None,
+            "height": None,
+            "created_date": None,
+        })
+
+    if len(members) < 2:
+        return None
+
+    # Keeper ("★ Best") = quality-first, earliest-taken tiebreak — the
+    # same ranking auto-dedupe uses (see _keeper_key). Ascending sort,
+    # best first.
+    members.sort(key=_keeper_key)
+    ref = members[0]
+    others = members[1:]
+    ref_pid = ref["photo_id"]
+
+    # Score each member by exact cosine against the chosen reference.
+    # Vectors are unit-normalized, so dot product == cosine. One matmul over
+    # all members (vectors[idxs] @ ref_vec) instead of a Python dot per member
+    # — at low thresholds a single cluster can hold hundreds of photos, and the
+    # per-member loop was the dominant cost there.
+    ref_idx = ref.pop("_idx")
+    ref["similarity_score"] = 1.0
+    other_idxs = [m.pop("_idx") for m in others]
+    sims = vectors[other_idxs] @ vectors[ref_idx]
+    for m, sc in zip(others, sims):
+        m["similarity_score"] = float(sc)
+    avg_sim = float(sims.mean()) if len(sims) else 0.0
+
+    def _fmt_size(b):
+        if b >= 1_000_000:
+            return f"{b / 1_000_000:.2f} MB"
+        return f"{b / 1_000:.1f} KB"
+
+    ref_size = ref.get("file_size") or 0
+    reasons = []
+    if ref_size > 0 and others:
+        other_sizes = [(m.get("file_size") or 0) for m in others]
+        biggest_other = max(other_sizes)
+        if ref_size == biggest_other:
+            reasons.append(f"Identical file size: {_fmt_size(ref_size)}")
+            ref_name = ref.get("filename", "")
+            other_names = [m.get("filename", "") for m in others]
+            has_copy_suffix = any("(" in n or "copy" in n.lower() for n in other_names)
+            if has_copy_suffix and "(" not in ref_name and "copy" not in ref_name.lower():
+                reasons.append(f"Filename \"{ref_name}\" appears to be the original (others have copy suffixes)")
+        elif ref_size > biggest_other:
+            pct = ((ref_size - biggest_other) / biggest_other * 100) if biggest_other > 0 else 0
+            reasons.append(f"Largest file: {_fmt_size(ref_size)} vs next {_fmt_size(biggest_other)} (+{pct:.0f}%)")
+        else:
+            reasons.append(f"File size: {_fmt_size(ref_size)} (a larger file exists at {_fmt_size(biggest_other)} but its format is less universal)")
+    if ref.get("mime_type"):
+        ref_fmt = ref["mime_type"]
+        # Coerce None/missing to "?" — Photo.mime_type is nullable in
+        # Postgres, and a mixed list of None and str crashes sorted().
+        other_fmts = sorted({(m.get("mime_type") or "?") for m in others})
+        is_preferred = ref_fmt in _PREFERRED_MIME_TYPES
+        fmt_note = "preferred (universal)" if is_preferred else "less universal"
+        reasons.append(f"Format: {ref_fmt} ({fmt_note}) — others: {', '.join(other_fmts)}")
+    if ref.get("uploaded_at"):
+        reasons.append(f"Scanned: {ref['uploaded_at'][:10]}")
+    if not reasons:
+        reasons.append("First in similarity ranking")
+
+    return {
+        "group_id": f"grp-{ref_pid}",
+        "similarity_score": avg_sim,
+        # Group quality = the kept ("Best") photo's quality, i.e. the
+        # highest in the group. min_quality filters on this.
+        "quality_score": ref.get("quality_score", 0.0),
+        "reference_photo": ref,
+        "similar_photos": others,
+        "best_reasons": reasons,
+    }
+
+
+def _list_groups_sync(threshold, skip, limit, min_quality, sort_by):
+    """Synchronous worker for GET /similarity-groups, run in a threadpool so a
+    big cluster build never blocks the event loop (and stalls /stats, the WS,
+    or other slider requests).
+
+    Hot-path optimization: when there's no global sort or quality filter (the
+    common slider case), it clusters once (memoized) for the total, then builds
+    the expensive per-group metadata for ONLY the requested page — not all
+    hundreds of groups. With a sort/quality filter every group's score is
+    needed, so it falls back to building them all."""
+    if threshold is not None and threshold > 1.0:
+        return {"total": 0, "skip": skip, "limit": limit, "groups": []}
+
+    cache_data, photo_meta = _get_cached_data()
+    if cache_data is None:
+        return {"total": 0, "skip": skip, "limit": limit, "groups": []}
+
+    vectors = cache_data["vectors"]
+    photo_ids = cache_data["photo_ids"]
+    cache_floor = cache_data.get("cache_threshold", _SIM_CACHE_THRESHOLD)
+    thr = 0.85 if threshold is None else threshold
+    if thr >= 1.0:
+        thr = 1.0 - _PURE_DUPE_EPSILON
+    effective_threshold = max(thr, cache_floor)
+
+    max_effective_size = cache_data.get("max_effective_size")
+    if max_effective_size is None:
+        max_effective_size = max(
+            (_effective_size(m) for m in (photo_meta or {}).values()), default=0.0
+        )
+        cache_data["max_effective_size"] = max_effective_size
+
+    components = _threshold_components_cached(cache_data, effective_threshold)
+
+    def _build(comp):
+        return _build_group_for_component(
+            comp, vectors, photo_ids, photo_meta, max_effective_size
+        )
+
+    needs_all = (sort_by is not None) or (min_quality is not None)
+    if not needs_all:
+        # Components are already size>=2, so each yields exactly one group →
+        # total is just the component count, and we materialize only the page.
+        total = len(components)
+        page = [g for c in components[skip:skip + limit] if (g := _build(c)) is not None]
+        return {"total": total, "skip": skip, "limit": limit, "groups": page}
+
+    groups = [g for c in components if (g := _build(c)) is not None]
+    if min_quality is not None:
+        groups = [g for g in groups if g.get("quality_score", 0) >= min_quality]
+    if sort_by == "similarity":
+        groups.sort(key=lambda g: g.get("similarity_score", 0), reverse=True)
+    elif sort_by == "quality":
+        groups.sort(key=lambda g: g.get("quality_score", 0), reverse=True)
+    return {
+        "total": len(groups),
+        "skip": skip,
+        "limit": limit,
+        "groups": groups[skip:skip + limit],
+    }
 
 
 @app.get("/similarity-groups")
@@ -2440,28 +2559,21 @@ async def list_similarity_groups(
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
+    if sort_by is not None and sort_by not in ("similarity", "quality"):
+        raise HTTPException(status_code=400, detail=f"Invalid sort_by: {sort_by}")
     # min_similarity is the clustering threshold: a pair appears together
     # iff cos(a,b) >= min_similarity. We do NOT additionally filter on the
     # group's avg-to-reference similarity afterwards — that would silently
     # drop legitimate clusters whose ref differs from the seed by ε.
-    threshold = min_similarity if min_similarity is not None else 0.85
-    groups = _build_similarity_groups_from_qdrant(threshold)
-
-    if min_quality is not None:
-        groups = [g for g in groups if g.get("quality_score", 0) >= min_quality]
-
-    # Sort
-    if sort_by is not None:
-        if sort_by == "similarity":
-            groups.sort(key=lambda g: g.get("similarity_score", 0), reverse=True)
-        elif sort_by == "quality":
-            groups.sort(key=lambda g: g.get("quality_score", 0), reverse=True)
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid sort_by: {sort_by}")
-
-    total = len(groups)
-    paged = groups[skip : skip + limit]
-    return {"total": total, "skip": skip, "limit": limit, "groups": paged}
+    #
+    # Build off the event loop: clustering + metadata is CPU-bound and used to
+    # run inline, so one slow slider request blocked every other request (and
+    # the WS), and a flurry of slider moves serialized into a multi-second
+    # backlog. run_in_executor keeps the loop free to serve the latest request.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _list_groups_sync, min_similarity, skip, limit, min_quality, sort_by
+    )
 
 
 @app.get("/similarity-groups/{group_id}")

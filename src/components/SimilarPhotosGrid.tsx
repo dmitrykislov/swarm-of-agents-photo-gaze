@@ -147,6 +147,35 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
         </h2>
         {pager}
       </div>
+      {/* Results area: while a threshold/page fetch is in flight, dim the
+          current results and show an overlay so the slider feels responsive
+          even when the backend is still clustering. */}
+      <div style={{ position: 'relative' }}>
+        {loading && (
+          <div
+            aria-busy="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: 5,
+              display: 'flex',
+              alignItems: 'flex-start',
+              justifyContent: 'center',
+              paddingTop: '2rem',
+              background: 'rgba(255,255,255,0.55)',
+              pointerEvents: 'none',
+            }}
+          >
+            <span className="muted">Updating results…</span>
+          </div>
+        )}
+        <div
+          style={{
+            opacity: loading ? 0.4 : 1,
+            transition: 'opacity 120ms ease',
+            pointerEvents: loading ? 'none' : 'auto',
+          }}
+        >
       {groups.map((group) => (
         <div
           key={group.group_id}
@@ -204,6 +233,8 @@ const SimilarPhotosGrid: React.FC<SimilarPhotosGridProps> = ({ jobId, threshold 
           </div>
         </div>
       ))}
+        </div>
+      </div>
       {totalPages > 1 && <div className="pager pager--bottom">{pager}</div>}
     </div>
   );
