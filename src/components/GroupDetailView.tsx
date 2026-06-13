@@ -181,7 +181,7 @@ const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose, onDel
         const isBestLb = currentLightboxPhoto.photo_id === effectiveBestId;
         const isSelectedLb = selectedPhotoIds.has(currentLightboxPhoto.photo_id);
         return (
-        <div className="lightbox-overlay" onClick={() => setLightboxPhotoId(null)}>
+        <div className="lightbox-overlay" data-testid="lightbox" onClick={() => setLightboxPhotoId(null)}>
           {lightboxLoading && <div className="lightbox-spinner">Loading...</div>}
           <img
             src={`${API_BASE}/photos/${lightboxPhotoId}/full`}

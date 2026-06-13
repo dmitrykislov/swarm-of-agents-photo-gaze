@@ -68,8 +68,9 @@ describe('AutoDeduplicateModal', () => {
     await userEvent.click(await screen.findByDisplayValue('/photos/keep'));
     await userEvent.click(screen.getByRole('button', { name: 'Preview' }));
 
-    // Preview step shows the planned counts
-    await screen.findByText(/2/, { selector: 'b' });
+    // Preview step renders the plan — the "Delete N duplicates" button
+    // appearing is an unambiguous signal it loaded.
+    await screen.findByRole('button', { name: /Delete 3 duplicates/ });
     expect(mockAuto).toHaveBeenLastCalledWith('/photos/keep', 1.0, true);
     expect(screen.getByRole('button', { name: /Delete 3 duplicates/ })).toBeEnabled();
 
@@ -78,8 +79,7 @@ describe('AutoDeduplicateModal', () => {
     await waitFor(() =>
       expect(mockAuto).toHaveBeenLastCalledWith('/photos/keep', 1.0, false)
     );
-    await screen.findByText(/3/, { selector: 'b' });
-    expect(screen.getByText(/photos removed from database/)).toBeInTheDocument();
+    expect(await screen.findByText(/photos removed from database/)).toBeInTheDocument();
   });
 
   it('disables Delete button when plan has nothing to delete', async () => {

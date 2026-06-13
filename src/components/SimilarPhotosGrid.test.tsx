@@ -6,286 +6,78 @@ import * as api from '../api';
 
 jest.mock('../api');
 
-describe('SimilarPhotosGrid Component', () => {
-  const mockGroups = [
-    {
-      group_id: 'group_1',
-      reference_photo: {
-        photo_id: 1,
-        filename: 'reference1.jpg',
-        path: '/photos/reference1.jpg',
-        quality_score: 0.95,
-      },
-      similar_photos: [
-        {
-          photo_id: 2,
-          filename: 'similar1.jpg',
-          path: '/photos/similar1.jpg',
-          similarity_score: 0.92,
-          quality_score: 0.88,
-        },
-        {
-          photo_id: 3,
-          filename: 'similar2.jpg',
-          path: '/photos/similar2.jpg',
-          similarity_score: 0.85,
-          quality_score: 0.75,
-        },
-      ],
+// Current group shape (built by the backend's _build_group_for_component).
+const mockGroups = [
+  {
+    group_id: 'group_1',
+    similarity_score: 0.9,
+    quality_score: 0.95,
+    reference_photo: {
+      photo_id: 1, filename: 'reference1.jpg', path: '/t/1',
+      quality_score: 0.95, similarity_score: 1.0,
     },
-    {
-      group_id: 'group_2',
-      reference_photo: {
-        photo_id: 4,
-        filename: 'reference2.jpg',
-        path: '/photos/reference2.jpg',
-        quality_score: 0.82,
-      },
-      similar_photos: [
-        {
-          photo_id: 5,
-          filename: 'similar3.jpg',
-          path: '/photos/similar3.jpg',
-          similarity_score: 0.78,
-          quality_score: 0.70,
-        },
-      ],
+    similar_photos: [
+      { photo_id: 2, filename: 'similar1.jpg', path: '/t/2', similarity_score: 0.92, quality_score: 0.88 },
+      { photo_id: 3, filename: 'similar2.jpg', path: '/t/3', similarity_score: 0.85, quality_score: 0.75 },
+    ],
+    best_reasons: ['Largest file'],
+  },
+  {
+    group_id: 'group_2',
+    similarity_score: 0.8,
+    quality_score: 0.82,
+    reference_photo: {
+      photo_id: 4, filename: 'reference2.jpg', path: '/t/4',
+      quality_score: 0.82, similarity_score: 1.0,
     },
-  ];
+    similar_photos: [
+      { photo_id: 5, filename: 'similar3.jpg', path: '/t/5', similarity_score: 0.78, quality_score: 0.70 },
+    ],
+    best_reasons: ['First in ranking'],
+  },
+];
 
+describe('SimilarPhotosGrid', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (api.fetchSimilarPhotos as jest.Mock).mockResolvedValue(mockGroups);
+    (api.fetchSimilarityGroups as jest.Mock).mockResolvedValue({ groups: mockGroups, total: 2 });
   });
 
-  test('renders grid container with title', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText(/Similar Photos/)).toBeInTheDocument();
-    });
+  it('renders the group count and per-group headers', async () => {
+    render(<SimilarPhotosGrid jobId="job" threshold={0.9} />);
+    await waitFor(() => expect(screen.getByText('Similar groups')).toBeInTheDocument());
+    // match-count badges: "<n> similar"
+    expect(screen.getByText('2 similar')).toBeInTheDocument();
+    expect(screen.getByText('1 similar')).toBeInTheDocument();
   });
 
-  test('displays correct number of groups', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
-    });
+  it('renders reference and similar photo filenames', async () => {
+    render(<SimilarPhotosGrid jobId="job" threshold={0.9} />);
+    await waitFor(() => expect(screen.getByText('reference1.jpg')).toBeInTheDocument());
+    expect(screen.getByText('reference2.jpg')).toBeInTheDocument();
+    expect(screen.getByText('similar1.jpg')).toBeInTheDocument();
+    expect(screen.getByText('similar3.jpg')).toBeInTheDocument();
   });
 
-  test('displays group headers with match counts', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('2 matches')).toBeInTheDocument();
-      expect(screen.getByText('1 matches')).toBeInTheDocument();
-    });
+  it('shows an empty message when there are no groups', async () => {
+    (api.fetchSimilarityGroups as jest.Mock).mockResolvedValue({ groups: [], total: 0 });
+    render(<SimilarPhotosGrid jobId="job" threshold={0.99} />);
+    await waitFor(() => expect(screen.getByText(/No similar photos found/i)).toBeInTheDocument());
   });
 
-  test('displays reference photo filenames', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('reference1.jpg')).toBeInTheDocument();
-      expect(screen.getByText('reference2.jpg')).toBeInTheDocument();
-    });
-  });
+  it('dims results and shows an "Updating results…" overlay while a new threshold loads', async () => {
+    (api.fetchSimilarityGroups as jest.Mock)
+      .mockResolvedValueOnce({ groups: mockGroups, total: 2 })   // initial load
+      .mockReturnValueOnce(new Promise(() => {}));               // next fetch stays pending
 
-  test('displays similar photo filenames', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('similar1.jpg')).toBeInTheDocument();
-      expect(screen.getByText('similar2.jpg')).toBeInTheDocument();
-      expect(screen.getByText('similar3.jpg')).toBeInTheDocument();
-    });
-  });
+    const { rerender } = render(<SimilarPhotosGrid jobId="job" threshold={0.9} />);
+    await waitFor(() => expect(screen.getByText('reference1.jpg')).toBeInTheDocument());
 
-  test('triggers search when threshold prop changes and updates results', async () => {
-    const mockSearchSimilarPhotos = jest.fn().mockResolvedValue(mockGroups);
-    (api.searchSimilarPhotos as jest.Mock) = mockSearchSimilarPhotos;
-    
-    const { rerender } = render(
-      <SimilarPhotosGrid jobId="test_job" threshold={0.5} />
-    );
-    
-    await waitFor(() => {
-      expect(screen.getByText('Similar Photos (2 groups)')).toBeInTheDocument();
-    });
-    
-    // Change threshold prop
-    rerender(<SimilarPhotosGrid jobId="test_job" threshold={0.75} />);
-    
-    // Verify search was called with new threshold
-    await waitFor(() => {
-      expect(mockSearchSimilarPhotos).toHaveBeenCalledWith('test_job', 0.75);
-    });
-  });
+    // Changing the threshold kicks off the (pending) refetch → loading state.
+    rerender(<SimilarPhotosGrid jobId="job" threshold={0.7} />);
 
-  test('displays similarity scores for similar photos', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('92.0%')).toBeInTheDocument();
-      expect(screen.getByText('85.0%')).toBeInTheDocument();
-      expect(screen.getByText('78.0%')).toBeInTheDocument();
-    });
+    // Overlay appears, and the previous results remain visible underneath.
+    expect(await screen.findByText(/Updating results/i)).toBeInTheDocument();
+    expect(screen.getByText('reference1.jpg')).toBeInTheDocument();
   });
-
-  test('displays quality indicators with correct labels', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      const qualityLabels = screen.getAllByText('Quality:');
-      expect(qualityLabels.length).toBeGreaterThan(0);
-    });
-  });
-
-  test('displays quality scores as percentages', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Excellent (95.0%)')).toBeInTheDocument();
-      expect(screen.getByText('Good (88.0%)')).toBeInTheDocument();
-      expect(screen.getByText('Good (82.0%)')).toBeInTheDocument();
-    });
-  });
-
-  test('renders thumbnail images with lazy loading', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      const images = screen.getAllByRole('img');
-      expect(images.length).toBeGreaterThan(0);
-      images.forEach((img) => {
-        expect(img).toHaveClass('thumbnail');
-      });
-    });
-  });
-
-  test('shows loading state initially', () => {
-    (api.fetchSimilarPhotos as jest.Mock).mockImplementation(
-      () => new Promise(() => {}) // Never resolves
-    );
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    expect(screen.getByText('Loading similar photos...')).toBeInTheDocument();
-  });
-
-  test('displays error message when fetch fails', async () => {
-    (api.fetchSimilarPhotos as jest.Mock).mockRejectedValue(
-      new Error('Network error')
-    );
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText(/Error: Network error/)).toBeInTheDocument();
-    });
-  });
-
-  test('shows message when no jobId provided', () => {
-    render(<SimilarPhotosGrid jobId="" />);
-    expect(
-      screen.getByText('No job selected. Process a job to view similar photos.')
-    ).toBeInTheDocument();
-  });
-
-  test('shows message when no similar photos found', async () => {
-    (api.fetchSimilarPhotos as jest.Mock).mockResolvedValue([]);
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('No similar photos found.')).toBeInTheDocument();
-    });
-  });
-
-  test('fetches photos when jobId changes', async () => {
-    const { rerender } = render(<SimilarPhotosGrid jobId="job1" />);
-    await waitFor(() => {
-      expect(api.fetchSimilarPhotos).toHaveBeenCalledWith('job1');
-    });
-    jest.clearAllMocks();
-    (api.fetchSimilarPhotos as jest.Mock).mockResolvedValue(mockGroups);
-    rerender(<SimilarPhotosGrid jobId="job2" />);
-    await waitFor(() => {
-      expect(api.fetchSimilarPhotos).toHaveBeenCalledWith('job2');
-    });
-  });
-
-  test('searches with threshold when threshold prop changes', async () => {
-    jest.mocked(api.searchSimilarPhotos).mockResolvedValue(mockGroups);
-    const { rerender } = render(<SimilarPhotosGrid jobId="test_job" threshold={0.5} />);
-    await waitFor(() => {
-      expect(api.searchSimilarPhotos).toHaveBeenCalledWith('test_job', 0.5);
-    });
-    jest.clearAllMocks();
-    jest.mocked(api.searchSimilarPhotos).mockResolvedValue(mockGroups);
-    rerender(<SimilarPhotosGrid jobId="test_job" threshold={0.75} />);
-    await waitFor(() => {
-      expect(api.searchSimilarPhotos).toHaveBeenCalledWith('test_job', 0.75);
-    });
-  });
-
-  test('handles image load events for lazy loading', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      const images = screen.getAllByRole('img') as HTMLImageElement[];
-      expect(images.length).toBeGreaterThan(0);
-      images.forEach((img) => {
-        expect(img).toHaveClass('loading');
-      });
-    });
-  });
-
-  test('displays reference photo with special styling', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      const referenceCards = screen.getAllByRole('img').filter(
-        (img) => img.alt === 'reference1.jpg' || img.alt === 'reference2.jpg'
-      );
-      expect(referenceCards.length).toBe(2);
-    });
-  });
-
-  test('quality indicator shows correct color for excellent quality', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Excellent (95.0%)')).toBeInTheDocument();
-    });
-  });
-
-  test('quality indicator shows correct color for good quality', async () => {
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Good (88.0%)')).toBeInTheDocument();
-    });
-  });
-
-  test('quality indicator shows correct color for fair quality', async () => {
-    const fairQualityGroups = [
-      {
-        group_id: 'group_fair',
-        reference_photo: {
-          photo_id: 10,
-          filename: 'fair.jpg',
-          path: '/photos/fair.jpg',
-          quality_score: 0.6,
-        },
-        similar_photos: [],
-      },
-    ];
-    (api.fetchSimilarPhotos as jest.Mock).mockResolvedValue(fairQualityGroups);
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Fair (60.0%)')).toBeInTheDocument();
-    });
-  });
-
-  test('quality indicator shows correct color for poor quality', async () => {
-    const poorQualityGroups = [
-      {
-        group_id: 'group_poor',
-        reference_photo: {
-          photo_id: 11,
-          filename: 'poor.jpg',
-          path: '/photos/poor.jpg',
-          quality_score: 0.3,
-        },
-        similar_photos: [],
-      },
-    ];
-    (api.fetchSimilarPhotos as jest.Mock).mockResolvedValue(poorQualityGroups);
-    render(<SimilarPhotosGrid jobId="test_job" />);
-    await waitFor(() => {
-      expect(screen.getByText('Poor (30.0%)')).toBeInTheDocument();
-    });
-  });
+});

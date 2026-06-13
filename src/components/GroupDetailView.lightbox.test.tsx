@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import GroupDetailView from './GroupDetailView';
@@ -92,11 +92,11 @@ describe('GroupDetailView — lightbox', () => {
   it('shows "★ Mark as Best" only on photos that are not currently Best', async () => {
     render(<GroupDetailView group={group} onClose={() => {}} />);
 
-    // Open the auto-picked Best (photo 1) — no Mark-as-Best button.
+    // Open the auto-picked Best (photo 1). Scope to the lightbox — the card
+    // grid behind it legitimately has Mark-as-Best buttons for other photos.
     await openLightboxOn('best.jpg');
-    expect(
-      screen.queryByRole('button', { name: /Mark as Best/i }),
-    ).not.toBeInTheDocument();
+    const lb = screen.getByTestId('lightbox');
+    expect(within(lb).queryByText(/Mark as Best/i)).not.toBeInTheDocument();
   });
 
   it('Mark-as-Best on a non-Best photo flips the badge and unmarks delete', async () => {
@@ -105,44 +105,34 @@ describe('GroupDetailView — lightbox', () => {
     });
     render(<GroupDetailView group={group} onClose={() => {}} />);
     await openLightboxOn('other.jpg');
+    const lb = screen.getByTestId('lightbox');
 
     // Initial state: this photo is NOT Best, was auto-selected for
     // deletion, so the badge says "DELETING — click to keep".
-    expect(
-      await screen.findByRole('button', { name: /DELETING/i }),
-    ).toBeInTheDocument();
+    expect(await within(lb).findByText(/DELETING/i)).toBeInTheDocument();
 
-    // Click "Mark as Best".
-    const markBestBtn = screen.getByRole('button', { name: /Mark as Best/i });
-    await userEvent.click(markBestBtn);
+    // Click "Mark as Best" (the lightbox badge has an action-describing
+    // aria-label, so match by its visible text).
+    await userEvent.click(within(lb).getByText(/Mark as Best/i));
 
-    // After promotion: photo 2 is now Best AND no longer marked for
-    // deletion. Badge should read "KEEPING (Best)".
+    // After promotion: photo 2 is now Best AND no longer marked for deletion.
     await waitFor(() =>
-      expect(screen.queryByRole('button', { name: /DELETING/i }))
-        .not.toBeInTheDocument()
+      expect(within(lb).queryByText(/DELETING/i)).not.toBeInTheDocument()
     );
-    expect(
-      screen.getByRole('button', { name: /KEEPING \(Best\)/i }),
-    ).toBeInTheDocument();
+    expect(within(lb).getByText(/KEEPING \(Best\)/i)).toBeInTheDocument();
   });
 
   it('Best photo can be toggled to delete from the lightbox', async () => {
     render(<GroupDetailView group={group} onClose={() => {}} />);
     await openLightboxOn('best.jpg');
+    const lb = screen.getByTestId('lightbox');
 
-    // The Best photo's badge is a button (not a span) — round-1 fix.
-    const keepBadge = await screen.findByRole('button', {
-      name: /KEEPING \(Best\)/i,
-    });
-    await userEvent.click(keepBadge);
+    // The Best photo's keep badge is a clickable button.
+    await userEvent.click(await within(lb).findByText(/KEEPING \(Best\)/i));
 
-    // After clicking, the Best is now marked for deletion. Badge reads
-    // "DELETING — click to keep".
+    // After clicking, the Best is now marked for deletion.
     await waitFor(() =>
-      expect(
-        screen.getByRole('button', { name: /DELETING.*click to keep/i }),
-      ).toBeInTheDocument()
+      expect(within(lb).getByText(/DELETING.*click to keep/i)).toBeInTheDocument()
     );
   });
 

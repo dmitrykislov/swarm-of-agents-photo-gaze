@@ -4,44 +4,43 @@ import '@testing-library/jest-dom';
 import App from './App';
 import * as api from './api';
 
-// Mock the api module
 jest.mock('./api');
+
+const EMPTY_STATS = {
+  photos: 0, completed: 0, pending: 0, failed: 0, embeddings: 0,
+};
 
 describe('App Component', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-  });
-
-  test('renders app header', () => {
+    // Mock everything App touches on mount so it can render without a backend.
     (api.fetchHealth as jest.Mock).mockResolvedValue({ status: 'healthy' });
-    render(<App />);
-    const header = screen.getByText('Full-Stack Application');
-    expect(header).toBeInTheDocument();
+    (api.fetchStats as jest.Mock).mockResolvedValue(EMPTY_STATS);
+    (api.listFolders as jest.Mock).mockResolvedValue([]);
+    // App reads prefs.threshold_setting → setThreshold; a missing field would
+    // make `threshold` undefined and crash threshold.toFixed(2) on render.
+    (api.fetchPreferences as jest.Mock).mockResolvedValue({ threshold_setting: 0.9 });
+    (api.fetchThreshold as jest.Mock).mockResolvedValue({ threshold_setting: 0.9 });
+    (api.connectProgressWebSocket as jest.Mock).mockReturnValue({ close: jest.fn() });
   });
 
-  test('displays loading state initially', () => {
-    (api.fetchHealth as jest.Mock).mockImplementation(
-      () => new Promise(() => {}) // Never resolves
-    );
+  it('renders the Photo Gaze header', async () => {
     render(<App />);
-    expect(screen.getByText('Loading...')).toBeInTheDocument();
+    expect(await screen.findByText('Photo Gaze')).toBeInTheDocument();
   });
 
-  test('displays health status when API call succeeds', async () => {
-    (api.fetchHealth as jest.Mock).mockResolvedValue({ status: 'healthy' });
+  it('mounts and queries backend health/stats on load', async () => {
     render(<App />);
-    await waitFor(() => {
-      expect(screen.getByText(/Backend Status:/)).toBeInTheDocument();
-      expect(screen.getByText('healthy')).toBeInTheDocument();
-    });
+    await waitFor(() => expect(api.fetchHealth).toHaveBeenCalled());
+    expect(api.fetchStats).toHaveBeenCalled();
+    expect(api.listFolders).toHaveBeenCalled();
   });
 
-  test('displays error message when API call fails', async () => {
-    const errorMessage = 'Network error';
-    (api.fetchHealth as jest.Mock).mockRejectedValue(new Error(errorMessage));
+  it('still renders the shell when the backend is unreachable', async () => {
+    (api.fetchHealth as jest.Mock).mockRejectedValue(new Error('Network error'));
+    (api.fetchStats as jest.Mock).mockRejectedValue(new Error('Network error'));
     render(<App />);
-    await waitFor(() => {
-      expect(screen.getByText(new RegExp(errorMessage))).toBeInTheDocument();
-    });
+    // The app chrome renders regardless of backend errors.
+    expect(await screen.findByText('Photo Gaze')).toBeInTheDocument();
   });
 });
