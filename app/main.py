@@ -1498,7 +1498,15 @@ async def get_thumbnail(photo_id: int, size: int = 200):
         thumb_path = thumbnail_service.get_thumbnail(
             photo.file_path, cache_key, size=(size, size)
         )
-        return FileResponse(thumb_path, media_type="image/jpeg")
+        # The frontend appends ?v=<file_hash>, so a given URL maps to one exact
+        # image forever — safe to cache hard. Without a real hash we can't make
+        # that promise (a reused photo_id could change the image), so forbid
+        # browser caching to avoid showing a stale thumbnail.
+        if photo.file_hash:
+            headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        else:
+            headers = {"Cache-Control": "no-cache"}
+        return FileResponse(thumb_path, media_type="image/jpeg", headers=headers)
     except Exception as e:
         logger.error("Error generating thumbnail for photo %d: %s", photo_id, e, exc_info=True)
         return JSONResponse(status_code=500, content={
@@ -1741,13 +1749,17 @@ def _compute_sim_cache():
     try:
         rows = session.query(
             Photo.id, Photo.filename, Photo.file_path,
-            Photo.file_size, Photo.mime_type, Photo.uploaded_at
+            Photo.file_size, Photo.mime_type, Photo.uploaded_at,
+            Photo.file_hash,
         ).all()
         for r in rows:
             photo_meta[r[0]] = {
                 "filename": r[1], "file_path": r[2], "file_size": r[3],
                 "mime_type": r[4],
                 "uploaded_at": r[5].isoformat() if r[5] else None,
+                # Carried so the thumbnail URL can be content-addressed (cache
+                # busting) — see _build_group_for_component.
+                "file_hash": r[6],
             }
     finally:
         session.close()
@@ -2172,14 +2184,16 @@ def _incremental_add_sync(new_pids: set):
         }
         meta_rows = (
             session.query(_Photo.id, _Photo.filename, _Photo.file_path,
-                          _Photo.file_size, _Photo.mime_type, _Photo.uploaded_at)
+                          _Photo.file_size, _Photo.mime_type, _Photo.uploaded_at,
+                          _Photo.file_hash)
             .filter(_Photo.id.in_(add_pids)).all()
         )
     finally:
         session.close()
     new_meta = {
         r[0]: {"filename": r[1], "file_path": r[2], "file_size": r[3],
-               "mime_type": r[4], "uploaded_at": r[5].isoformat() if r[5] else None}
+               "mime_type": r[4], "uploaded_at": r[5].isoformat() if r[5] else None,
+               "file_hash": r[6]}
         for r in meta_rows
     }
     add_pids = [p for p in add_pids if p in pid_to_point and p in new_meta]
@@ -2388,11 +2402,18 @@ def _build_group_for_component(component, vectors, photo_ids, photo_meta, max_ef
     for j in component:
         pid = photo_ids[j]
         meta = photo_meta.get(pid) or {}
+        # Content-address the thumbnail URL with the file hash. photo_ids are
+        # reused by SQLite after a delete, so /thumbnails/{pid} alone would let
+        # the browser serve a cached thumbnail of a DIFFERENT image; the ?v=
+        # hash changes whenever the underlying file does, forcing a refresh.
+        ver = (meta.get("file_hash") or str(pid))[:16]
         members.append({
             "_idx": j,
             "photo_id": pid,
             "filename": meta.get("filename") or str(pid),
-            "path": f"{BACKEND_PUBLIC_URL}/thumbnails/{pid}",
+            "path": f"{BACKEND_PUBLIC_URL}/thumbnails/{pid}?v={ver}",
+            # Exposed so the lightbox can cache-bust the full-resolution URL too.
+            "file_hash": meta.get("file_hash"),
             "similarity_score": 0.0,  # placeholder, recomputed below
             "quality_score": _quality_score(meta, max_effective_size),
             "file_size": meta.get("file_size"),

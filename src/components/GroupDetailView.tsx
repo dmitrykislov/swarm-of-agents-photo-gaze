@@ -12,6 +12,7 @@ interface Photo {
   file_path?: string;
   mime_type?: string;
   uploaded_at?: string;
+  file_hash?: string;
   width?: number;
   height?: number;
   created_date?: string;
@@ -184,7 +185,7 @@ const GroupDetailView: React.FC<GroupDetailViewProps> = ({ group, onClose, onDel
         <div className="lightbox-overlay" data-testid="lightbox" onClick={() => setLightboxPhotoId(null)}>
           {lightboxLoading && <div className="lightbox-spinner">Loading...</div>}
           <img
-            src={`${API_BASE}/photos/${lightboxPhotoId}/full`}
+            src={`${API_BASE}/photos/${lightboxPhotoId}/full?v=${(currentLightboxPhoto.file_hash || String(lightboxPhotoId)).slice(0, 16)}`}
             alt="Full resolution"
             className="lightbox-image"
             style={{ opacity: lightboxLoading ? 0.3 : 1 }}

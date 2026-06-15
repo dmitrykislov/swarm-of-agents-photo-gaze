@@ -78,17 +78,22 @@ function App() {
     }
   };
 
-  const selectCurrentFolder = async () => {
-    if (!browseData) return;
+  // Add a specific folder path (a row's "+ Add", or the current dir). Lets the
+  // user add a folder straight from the list without first navigating INTO it.
+  const addFolderPath = async (path: string) => {
     setFolderError('');
     try {
-      await addFolder(browseData.path);
+      await addFolder(path);
       await refreshFolders();
       setBrowserOpen(false);
       setBrowseData(null);
     } catch (e) {
       setFolderError(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  const selectCurrentFolder = () => {
+    if (browseData) addFolderPath(browseData.path);
   };
 
   // Actually performs the deletion — only called after the user confirms in
@@ -327,25 +332,44 @@ function App() {
                     <span className="browser__count">{browseData.image_count} images</span>
                   )}
                   <button className="btn btn--primary btn--sm" onClick={selectCurrentFolder}>
-                    Select this folder
+                    + Add this folder
                   </button>
                   <button className="btn btn--ghost btn--sm" onClick={() => { setBrowserOpen(false); setBrowseData(null); }}>Cancel</button>
                 </div>
+                <p className="muted" style={{ margin: '4px 0 8px' }}>
+                  Click a folder to open it, or <strong>+ Add</strong> to include it (with all its sub-folders).
+                </p>
                 {browseLoading ? (
                   <p className="muted">Loading…</p>
                 ) : browseData && browseData.dirs.length === 0 ? (
-                  <p className="muted">No subdirectories.</p>
+                  <p className="muted">No sub-folders here — use <strong>+ Add this folder</strong> above to add the current one.</p>
                 ) : (
                   <div className="browser__list">
-                    {browseData?.dirs.map((d) => (
-                      <button
-                        key={d.name}
-                        className="browser__dir"
-                        onClick={() => navigateTo(browseData.path.replace(/\/$/, '') + '/' + d.name)}
-                      >
-                        📁 {d.name}
-                      </button>
-                    ))}
+                    {browseData?.dirs.map((d) => {
+                      const full = browseData.path.replace(/\/$/, '') + '/' + d.name;
+                      return (
+                        <div
+                          key={d.name}
+                          style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                        >
+                          <button
+                            className="browser__dir"
+                            style={{ flex: 1, textAlign: 'left' }}
+                            onClick={() => navigateTo(full)}
+                            title={`Open ${d.name}`}
+                          >
+                            📁 {d.name} ›
+                          </button>
+                          <button
+                            className="btn btn--primary btn--sm"
+                            onClick={() => addFolderPath(full)}
+                            title={`Add ${d.name} to your photo folders`}
+                          >
+                            + Add
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

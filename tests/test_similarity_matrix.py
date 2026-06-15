@@ -121,7 +121,9 @@ class _FakeRow:
         self._t = t
 
     def __getitem__(self, i):
-        return self._t[i]
+        # Columns added to the meta query later (e.g. file_hash) read as None
+        # for older fixtures, instead of IndexError.
+        return self._t[i] if i < len(self._t) else None
 
 
 class _FakeQuery:
