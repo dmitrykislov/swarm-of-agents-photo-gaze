@@ -610,6 +610,28 @@ async def get_trash_thumbnail(path: str, size: int = 240):
         })
 
 
+@app.post("/trash/reveal")
+async def reveal_trash():
+    """Open the trash folder in the OS file manager. This is a local desktop
+    app, so the backend can reveal it directly (a browser can't open a local
+    path). The path is fixed (TRASH_DIR), never user input — safe to pass to
+    the opener."""
+    import subprocess
+    import sys as _sys
+    os.makedirs(TRASH_DIR, exist_ok=True)
+    try:
+        if _sys.platform == "darwin":
+            opener = ["open", TRASH_DIR]
+        elif os.name == "nt":
+            opener = ["explorer", TRASH_DIR]
+        else:
+            opener = ["xdg-open", TRASH_DIR]
+        subprocess.Popen(opener, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"opened": TRASH_DIR}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e), "path": TRASH_DIR})
+
+
 @app.post("/trash/recover")
 async def recover_from_trash(request: Request):
     """Move selected photos back from trash to their original paths and

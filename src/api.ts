@@ -352,6 +352,15 @@ export async function listTrash(): Promise<{ items: TrashItem[]; trash_dir: stri
   return response.json();
 }
 
+/** Open the trash folder in the OS file manager (Finder/Explorer). */
+export async function revealTrash(): Promise<{ opened: string }> {
+  const response = await fetch(`${API_BASE_URL}/trash/reveal`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`Failed to open trash folder: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export interface PhotoImageInfo {
   photo_id: number;
   width: number | null;

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { listTrash, recoverFromTrash, TrashItem, API_BASE_URL } from '../api';
+import { listTrash, recoverFromTrash, revealTrash, TrashItem, API_BASE_URL } from '../api';
 import './TrashPage.css';
 
 interface TrashPageProps {
@@ -27,6 +27,15 @@ const TrashPage: React.FC<TrashPageProps> = ({ onClose }) => {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [recovering, setRecovering] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [trashDir, setTrashDir] = useState<string>('');
+
+  const openTrashFolder = async () => {
+    try {
+      await revealTrash();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const refresh = async () => {
     setLoading(true);
@@ -34,6 +43,7 @@ const TrashPage: React.FC<TrashPageProps> = ({ onClose }) => {
     try {
       const data = await listTrash();
       setItems(data.items);
+      setTrashDir(data.trash_dir);
       // Drop any selections that no longer exist in the new list.
       setSelected(prev => {
         const valid = new Set(data.items.map(i => i.trash_path));
@@ -108,6 +118,25 @@ const TrashPage: React.FC<TrashPageProps> = ({ onClose }) => {
           </button>
         </div>
       </header>
+
+      {trashDir && (
+        <div className="trash-page__location">
+          <span className="muted">Trash folder:</span>{' '}
+          <button
+            type="button"
+            className="trash-page__location-link"
+            onClick={openTrashFolder}
+            title="Open this folder on your computer"
+            style={{
+              background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+              color: 'var(--accent, #3b82f6)', textDecoration: 'underline',
+              font: 'inherit', wordBreak: 'break-all', textAlign: 'left',
+            }}
+          >
+            {trashDir} ↗
+          </button>
+        </div>
+      )}
 
       {statusMessage && (
         <div className="trash-page__status" role="status">{statusMessage}</div>
